@@ -5,7 +5,8 @@
 // of the surface (from the depth buffer, within a world-space radius that fades out) bounds the
 // part of the hemisphere the sky and the room can light, integrated analytically against the
 // cosine. Slices and steps are rotated per pixel and frame (blue noise) for the temporal AA or
-// DLSS to resolve. No extra passes or buffers.
+// DLSS to resolve. DeferredFS traces it at half resolution in the hook's light shaft pass and
+// upsamples it (AU_UpsampleAO), or per pixel when that pass is unavailable.
 // Requires the deferred pass's includes (SceneData, Reconstruction_inc, AU_Temporal).
 
 #ifndef AU_GTAO

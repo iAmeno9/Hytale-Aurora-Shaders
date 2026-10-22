@@ -16,12 +16,12 @@ Controls (Ores & materials): **Material gloss**, **Rain wetness** (the water fil
 
 **Lighting → Ambient occlusion method: Hytale SSAO / GTAO.** GTAO measures, per pixel, how much of the hemisphere above a surface is open, from the depth buffer. Corners, recesses, and objects resting on the ground are shaded by their real geometry. Bright materials lose less light to it, because light bounces between the occluding faces. Only indirect light is darkened (sky fill, torch light and the minimum cave light); the sun is left to the shadows. Foliage keeps Hytale's SSAO.
 
-- **GTAO quality:** Low traces 2 directions × 4 steps per pixel, Medium 2 × 6, High 3 × 8.
+- **GTAO quality:** Low traces 2 directions × 4 steps per point, Medium 2 × 6, High 3 × 8.
 - **GTAO radius:** how far around a surface occluders count, fading out smoothly toward the edge.
 - **Ambient occlusion:** the existing strength slider, used by both methods.
 - **Sky light from open directions:** with Sky-derived sky lighting, GTAO also finds the mean direction the sky is open from (the bent normal). Walls in recesses and under overhangs are then lit from the opening rather than from where they face. It takes no extra samples.
 
-The sampling pattern rotates per pixel and frame, and Aurora TAA or DLSS resolves it. Measured in game at Medium, it added about 0.3 ms to the lighting pass (4.42 → 4.74 ms) on the test scene. No passes or buffers are added.
+GTAO is traced at half resolution, one point per 2×2 pixels, in the same extra pass as the light shafts. Each pixel then blends the four nearest points, weighted by depth and normal. If the hook can't set up that pass, GTAO runs per pixel instead. The sampling pattern rotates per point and frame, and Aurora TAA or DLSS resolves it. At High on an M4 Pro at 4112x2516, tracing at half resolution took the frame from 46.7 to 39.6 ms. Per pixel at Medium, it had added about 0.3 ms to the lighting pass (4.42 → 4.74 ms) on the original test scene.
 
 ## Water colour
 
