@@ -992,6 +992,7 @@ static int relink_program(GLuint prog, ProgRec *p, int useOverrides)
 #define MAX_UNITS 48
 #define VL_UNIT 36   // half-resolution light shafts; GL 4.1 guarantees 80 combined units
 #define AO_UNIT 37   // half-resolution GTAO, from the same pass
+#define GI_UNIT 38   // half-resolution screen-space GI, from the same pass
 typedef struct { GLenum target; GLuint tex; GLuint sampler; } UnitState;
 static UnitState g_units[MAX_UNITS];
 static GLuint g_activeUnit;
@@ -1665,13 +1666,13 @@ static void gi_draw(GLenum mode, GLint first, GLsizei count)
 // Half-resolution passes for any program with uHookVLPass: one extra draw of it (uHookVLPass 1)
 // traces only its soft, costly parts into two half-size targets, and the real draw (uHookVLPass 2)
 // upsamples them by depth; 0 = trace per pixel as before. DeferredShadowFS traces its contact
-// shadows; DeferredFS, later in the frame, its light shafts, GTAO and cloud shadows.
+// shadows; DeferredFS, later in the frame, its light shafts, GTAO, cloud shadows and screen-space GI.
 #define VL_GL_BLEND 0x0BE2
 #define VL_GL_SCISSOR_TEST 0x0C11
 #define VL_GL_DRAW_FRAMEBUFFER 0x8CA9
 #define VL_GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
 #define VL_GL_COLOR_ATTACHMENT0 0x8CE0
-static GLuint g_vlTex, g_aoTex, g_vlFbo;
+static GLuint g_halfTex[3], g_vlFbo;   // light shafts (RGBA16F), GTAO (RGBA8), GI (RGBA16F)
 static int g_vlW, g_vlH;
 
 static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count)
@@ -1706,22 +1707,21 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
         PFN_glTexParameteri parameter = (PFN_glTexParameteri)GetProcAddress(g_real, "glTexParameteri");
         GLint previousTexture = 0;
         r_glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
-        if (!g_vlTex) gen(1, &g_vlTex);
-        if (!g_aoTex) gen(1, &g_aoTex);
         if (!g_vlFbo) genFramebuffers(1, &g_vlFbo);
         bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
-        for (int target = 0; target < 2; target++) {
-            r_glBindTexture(GL_TEXTURE_2D, target ? g_aoTex : g_vlTex);
-            if (target) image(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+        for (int target = 0; target < 3; target++) {
+            if (!g_halfTex[target]) gen(1, &g_halfTex[target]);
+            r_glBindTexture(GL_TEXTURE_2D, g_halfTex[target]);
+            if (target == 1) image(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
             else image(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-            framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0 + target, GL_TEXTURE_2D, target ? g_aoTex : g_vlTex, 0);
+            framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0 + target, GL_TEXTURE_2D, g_halfTex[target], 0);
         }
         r_glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
-        static const GLenum targets[2] = {VL_GL_COLOR_ATTACHMENT0, VL_GL_COLOR_ATTACHMENT0 + 1};
-        drawBuffers(2, targets);
+        static const GLenum targets[3] = {VL_GL_COLOR_ATTACHMENT0, VL_GL_COLOR_ATTACHMENT0 + 1, VL_GL_COLOR_ATTACHMENT0 + 2};
+        drawBuffers(3, targets);
         int complete = checkFramebuffer(VL_GL_DRAW_FRAMEBUFFER) == 0x8CD5;   // GL_FRAMEBUFFER_COMPLETE
         bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
         g_vlW = complete ? width : 0;
@@ -1742,15 +1742,14 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
     if (blend) enable(VL_GL_BLEND);
     if (scissor) enable(VL_GL_SCISSOR_TEST);
     profile_use(program->pname);
-    for (int target = 0; target < 2; target++) {
-        int unit = target ? AO_UNIT : VL_UNIT;
-        GLuint texture = target ? g_aoTex : g_vlTex;
-        r_glActiveTexture(GL_TEXTURE0 + unit);
-        r_glBindTexture(GL_TEXTURE_2D, texture);
-        if (r_glBindSampler) r_glBindSampler(unit, 0);
-        g_units[unit].target = GL_TEXTURE_2D;
-        g_units[unit].tex = texture;
-        g_units[unit].sampler = 0;
+    static const int units[3] = {VL_UNIT, AO_UNIT, GI_UNIT};
+    for (int target = 0; target < 3; target++) {
+        r_glActiveTexture(GL_TEXTURE0 + units[target]);
+        r_glBindTexture(GL_TEXTURE_2D, g_halfTex[target]);
+        if (r_glBindSampler) r_glBindSampler(units[target], 0);
+        g_units[units[target]].target = GL_TEXTURE_2D;
+        g_units[units[target]].tex = g_halfTex[target];
+        g_units[units[target]].sampler = 0;
     }
     r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
     r_glUniform1i(program->locVLPass, 2);
@@ -2708,6 +2707,8 @@ static void check_extras(GLuint prog, ProgRec *p)
     if (locVL >= 0) r_glUniform1i(locVL, VL_UNIT);
     GLint locAO = r_glGetUniformLocation(prog, "uHookAO");
     if (locAO >= 0) r_glUniform1i(locAO, AO_UNIT);
+    GLint locGI = r_glGetUniformLocation(prog, "uHookGI");
+    if (locGI >= 0) r_glUniform1i(locGI, GI_UNIT);
     p->locVLReady = r_glGetUniformLocation(prog, "uHookVLReady");
     if (p->locVLPass >= 0 || p->locVLReady >= 0) p->hasExtras = 1;
     p->giDenoise = r_glGetUniformLocation(prog, "auGIRaw") >= 0;

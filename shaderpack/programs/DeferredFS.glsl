@@ -59,9 +59,14 @@ flat in vec3 auSkyLightCube[6];   // the sky's ambient light per facing (ScreenV
 layout(location = 0) out vec4 outColor;
 
 #define AU_HALF_RES_CLOUDS (AU_CLOUDS && AU_CLOUD_SHADOWS)
-#if AU_LIGHTSHAFTS || AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS
-uniform int uHookVLPass;    // 1: this draw only traces the light shafts, GTAO and cloud shadows, at half resolution; 2: they are in uHookVL / uHookAO
-#if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS
+#define AU_HALF_RES_GI (AU_PRESET >= 2 && !AU_VOXELS && !AU_GI_DENOISE)   // the denoiser filters per pixel
+#if AU_LIGHTSHAFTS || AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
+uniform int uHookVLPass;    // 1: this draw only traces the light shafts, GTAO, cloud shadows and GI, at half resolution; 2: they are in uHookVL / uHookAO / uHookGI
+#if AU_HALF_RES_GI
+layout(location = 2) out vec4 outGI;   // half-resolution pass: screen-space GI (rgb) and its occlusion (a)
+uniform sampler2D uHookGI;
+#endif
+#if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
 layout(location = 1) out vec4 outAO;   // half-resolution pass: GTAO bent normal (octahedral, rg), visibility (b), cloud shadow (a)
 uniform sampler2D uHookAO;
 
@@ -82,17 +87,17 @@ vec3 AU_OctDecode(vec2 e)
     return normalize(n);
 }
 
-// The half-resolution GTAO and cloud shadow for a full-resolution pixel: the four nearest texels,
-// weighted like the shafts by how close the distance each one traced is to this pixel's. GTAO's are
-// also weighted by how well the bent normal fits this pixel's normal (texels of the other face at a
-// crease). xyz: bent normal, w: visibility.
-vec4 AU_UpsampleAO(vec2 uv, float lViewPos, vec3 normal, out float cloudShadow)
+// The half-resolution GTAO, cloud shadow and GI for a full-resolution pixel: the four nearest
+// texels, weighted like the shafts by how close the distance each one traced is to this pixel's.
+// GTAO's and the GI are also weighted by how well the bent normal fits this pixel's normal (texels
+// of the other face at a crease). xyz: bent normal, w: visibility; gi: GI (rgb) and its occlusion.
+vec4 AU_UpsampleAO(vec2 uv, float lViewPos, vec3 normal, out float cloudShadow, out vec4 gi)
 {
     ivec2 size = textureSize(uHookAO, 0);
     vec2 position = uv * vec2(size) - 0.5;
     ivec2 base = ivec2(floor(position));
     vec2 f = position - vec2(base);
-    vec4 sum = vec4(0.0);
+    vec4 sum = vec4(0.0), giSum = vec4(0.0);
     float total = 0.0, cloudSum = 0.0, cloudTotal = 0.0;
     for (int k = 0; k < 4; k++) {
         ivec2 offset = ivec2(k & 1, k >> 1);
@@ -105,11 +110,17 @@ vec4 AU_UpsampleAO(vec2 uv, float lViewPos, vec3 normal, out float cloudShadow)
         weight /= 0.001 + abs(traced - lViewPos) / max(lViewPos, 1.0);
         cloudSum += packed.a * weight;
         cloudTotal += weight;
+#if AU_AO_METHOD == 1
         weight *= max(dot(bent, normal), 0.05);
+#endif
         sum += vec4(bent, packed.b) * weight;
         total += weight;
+#if AU_HALF_RES_GI
+        giSum += texelFetch(uHookGI, texel, 0) * weight;
+#endif
     }
     cloudShadow = cloudTotal > 0.0 ? cloudSum / cloudTotal : 1.0;
+    gi = total > 0.0 ? giSum / total : vec4(0.0, 0.0, 0.0, 1.0);
     return total > 0.0 && dot(sum.xyz, sum.xyz) > 1e-8 ? vec4(normalize(sum.xyz), sum.w / total) : vec4(normal, 1.0);
 }
 #endif
@@ -126,6 +137,15 @@ vec4 AU_TraceHalfResVL()
         float candidateDepth = texelFetch(uDepthTexture, candidate, 0).r;
         if (candidateDepth < depth) { depth = candidateDepth; pixel = candidate; }
     }
+#if AU_HALF_RES_GI && AU_SSGI_SELF_HIT_FIX
+    // The surface's own plane for the GI's self-hit test: screen derivatives, before any return.
+    vec2 planeUV = (vec2(pixel) + 0.5) / vec2(size);
+#if USE_LINEAR_Z
+    vec3 geometricNormal = fastNormalFromPosition(mat3(InvViewMatrix) * AU_ViewPosition(planeUV, min(depth, 1.0) * FarClip));
+#else
+    vec3 geometricNormal = fastNormalFromPosition(PositionFromDepth(min(depth, 1.0), planeUV, InvViewProjectionMatrix));
+#endif
+#endif
     if (depth >= 1.0) {
         // All sky: trace the sky's shafts here for SkyFS (a = -1), along this texel's view ray.
         vec2 skyUV = (vec2(corner) + 1.0) / vec2(size);
@@ -143,13 +163,15 @@ vec4 AU_TraceHalfResVL()
     vec3 playerPos = PositionFromDepth(depth, uv, InvViewProjectionMatrix);
 #endif
     float lViewPos = length(playerPos);
-#if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS
+#if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
     vec4 halfRes = vec4(0.5, 0.5, 1.0, 1.0);
-#if AU_AO_METHOD == 1
+#if AU_AO_METHOD == 1 || AU_HALF_RES_GI
     vec3 normal = decodeNormal(texelFetch(uNormalTexture, pixel, 0).rg);
 #if !INPUT_NORMALS_IN_WS
     normal = mat3(InvViewMatrix) * normal;
 #endif
+#endif
+#if AU_AO_METHOD == 1
     vec3 bentNormalVS;
     float visibility = AU_GTAOVisibilityBent(uDepthTexture, uv, (ViewMatrix * vec4(playerPos, 1.0)).xyz, normalize(mat3(ViewMatrix) * normal),
                                              GetDither2(gl_FragCoord.xy + vec2(37.0, 71.0)), bentNormalVS);
@@ -159,6 +181,14 @@ vec4 AU_TraceHalfResVL()
     halfRes.a = GetCloudShadow(playerPos);
 #endif
     outAO = halfRes;
+#endif
+#if AU_HALF_RES_GI
+#if !AU_SSGI_SELF_HIT_FIX
+    vec3 geometricNormal = normal;
+#endif
+    float giVisibility;
+    vec3 gi = AU_GetSSGI(uDepthTexture, playerPos, normal, geometricNormal, GetDither(gl_FragCoord.xy), giVisibility);
+    outGI = vec4(gi, giVisibility);
 #endif
     return vec4(GetVolumetricLight(playerPos / max(lViewPos, 0.0001), lViewPos, false, GetDither(gl_FragCoord.xy)), lViewPos);
 }
@@ -275,7 +305,7 @@ void main()
     }
 #endif
     AU_InitCommon();
-#if AU_LIGHTSHAFTS || AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS
+#if AU_LIGHTSHAFTS || AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
     if (uHookVLPass == 1) { outColor = AU_TraceHalfResVL(); return; }
 #endif
 #if AU_SKY_LIGHTING == 1
@@ -328,12 +358,12 @@ void main()
 
     vec2 surfaceFootprint = AU_SurfaceFootprint(normal, gbuffer0.rgb);
     float dither = GetDither(gl_FragCoord.xy);
-#if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS
-    // GTAO and the clouds' shadow, traced at half resolution by the light shaft pass: GTAO is most
-    // of this pass's cost.
-    vec4 halfResAO = vec4(normal, 1.0);
+#if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
+    // GTAO, the clouds' shadow and the GI, traced at half resolution by the light shaft pass: GTAO
+    // and the GI are most of this pass's cost.
+    vec4 halfResAO = vec4(normal, 1.0), halfResGI = vec4(0.0, 0.0, 0.0, 1.0);
     float halfResCloud = 1.0;
-    if (uHookVLPass == 2 && !hasBloom) halfResAO = AU_UpsampleAO(texCoords, length(playerPos), normal, halfResCloud);
+    if (uHookVLPass == 2 && !hasBloom) halfResAO = AU_UpsampleAO(texCoords, length(playerPos), normal, halfResCloud, halfResGI);
 #endif
 #if AU_AO_METHOD == 1
     // GTAO in place of Hytale's SSAO on solid surfaces (foliage keeps Hytale's): horizon-based
@@ -491,6 +521,9 @@ void main()
         {
 #if AU_VOXELS
             gi = AU_GetVoxelGI(uDepthTexture, playerPos, normal, skyLight, giVisibility, skyVis);
+#elif AU_HALF_RES_GI
+            if (uHookVLPass == 2) { gi = halfResGI.rgb; giVisibility = halfResGI.a; }
+            else gi = AU_GetSSGI(uDepthTexture, playerPos, normal, historyNormal, dither, giVisibility);
 #else
             gi = AU_GetSSGI(uDepthTexture, playerPos, normal, historyNormal, dither, giVisibility);
 #endif
