@@ -504,6 +504,7 @@ typedef struct {
     GLint locVoxGeo, locVoxCol;
     GLint locVLPass;         // uHookVLPass: DeferredFS traces the light shafts at half resolution
     GLint locVLReady;        // uHookVLReady: those shafts are in uHookVL (DeferredFS, water)
+    GLint locHitLight;       // uHookHitLight: the program first fills the GI's hit-light cache (uHookVLPass 3)
     GLint locNativeEmission;
     GLint locMaterialLOD;
     GLint locJitter, locUIFragmentScale;
@@ -993,6 +994,7 @@ static int relink_program(GLuint prog, ProgRec *p, int useOverrides)
 #define VL_UNIT 36   // half-resolution light shafts; GL 4.1 guarantees 80 combined units
 #define AO_UNIT 37   // half-resolution GTAO, from the same pass
 #define GI_UNIT 38   // half-resolution screen-space GI, from the same pass
+#define HIT_UNIT 39  // the light each surface gives off, cached at half resolution for the GI's rays
 typedef struct { GLenum target; GLuint tex; GLuint sampler; } UnitState;
 static UnitState g_units[MAX_UNITS];
 static GLuint g_activeUnit;
@@ -1667,12 +1669,25 @@ static void gi_draw(GLenum mode, GLint first, GLsizei count)
 // traces only its soft, costly parts into two half-size targets, and the real draw (uHookVLPass 2)
 // upsamples them by depth; 0 = trace per pixel as before. DeferredShadowFS traces its contact
 // shadows; DeferredFS, later in the frame, its light shafts, GTAO, cloud shadows and screen-space GI.
+// A program with uHookHitLight first draws once more (uHookVLPass 3) into a fourth half-size target
+// of its own: the light each surface gives off, which the GI's rays then read instead of the G-buffer.
 #define VL_GL_BLEND 0x0BE2
 #define VL_GL_SCISSOR_TEST 0x0C11
 #define VL_GL_DRAW_FRAMEBUFFER 0x8CA9
 #define VL_GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
 #define VL_GL_COLOR_ATTACHMENT0 0x8CE0
 static GLuint g_halfTex[3], g_vlFbo;   // light shafts (RGBA16F), GTAO (RGBA8), GI (RGBA16F)
+static GLuint g_hitTex, g_hitFbo;       // the GI's hit-light cache (RGBA16F)
+
+static void bind_unit_2d(int unit, GLuint texture)
+{
+    r_glActiveTexture(GL_TEXTURE0 + unit);
+    r_glBindTexture(GL_TEXTURE_2D, texture);
+    if (r_glBindSampler) r_glBindSampler(unit, 0);
+    g_units[unit].target = GL_TEXTURE_2D;
+    g_units[unit].tex = texture;
+    g_units[unit].sampler = 0;
+}
 static int g_vlW, g_vlH;
 
 static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count)
@@ -1719,10 +1734,20 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
             framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0 + target, GL_TEXTURE_2D, g_halfTex[target], 0);
         }
-        r_glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
         static const GLenum targets[3] = {VL_GL_COLOR_ATTACHMENT0, VL_GL_COLOR_ATTACHMENT0 + 1, VL_GL_COLOR_ATTACHMENT0 + 2};
         drawBuffers(3, targets);
         int complete = checkFramebuffer(VL_GL_DRAW_FRAMEBUFFER) == 0x8CD5;   // GL_FRAMEBUFFER_COMPLETE
+        if (!g_hitTex) gen(1, &g_hitTex);
+        if (!g_hitFbo) genFramebuffers(1, &g_hitFbo);
+        r_glBindTexture(GL_TEXTURE_2D, g_hitTex);
+        image(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+        parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        parameter(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_hitFbo);
+        framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_hitTex, 0);
+        complete = complete && checkFramebuffer(VL_GL_DRAW_FRAMEBUFFER) == 0x8CD5;
+        r_glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
         bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
         g_vlW = complete ? width : 0;
         g_vlH = complete ? height : 0;
@@ -1730,10 +1755,21 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
         if (!complete) return;
     }
     GLboolean blend = isEnabled(VL_GL_BLEND), scissor = isEnabled(VL_GL_SCISSOR_TEST);
-    bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
+    // None of the half-size textures may stay bound for sampling while it is a draw's target.
+    static const int units[3] = {VL_UNIT, AO_UNIT, GI_UNIT};
+    for (int target = 0; target < 3; target++) bind_unit_2d(units[target], 0);
+    bind_unit_2d(HIT_UNIT, 0);
     setViewport(0, 0, width, height);
     if (blend) disable(VL_GL_BLEND);
     if (scissor) disable(VL_GL_SCISSOR_TEST);
+    if (program->locHitLight >= 0) {
+        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_hitFbo);
+        profile_use("Half-res hit light");
+        r_glUniform1i(program->locVLPass, 3);
+        r_glDrawArrays(mode, first, count);
+        bind_unit_2d(HIT_UNIT, g_hitTex);
+    }
+    bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
     profile_use("Half-res pass");
     r_glUniform1i(program->locVLPass, 1);
     r_glDrawArrays(mode, first, count);
@@ -1742,15 +1778,7 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
     if (blend) enable(VL_GL_BLEND);
     if (scissor) enable(VL_GL_SCISSOR_TEST);
     profile_use(program->pname);
-    static const int units[3] = {VL_UNIT, AO_UNIT, GI_UNIT};
-    for (int target = 0; target < 3; target++) {
-        r_glActiveTexture(GL_TEXTURE0 + units[target]);
-        r_glBindTexture(GL_TEXTURE_2D, g_halfTex[target]);
-        if (r_glBindSampler) r_glBindSampler(units[target], 0);
-        g_units[units[target]].target = GL_TEXTURE_2D;
-        g_units[units[target]].tex = g_halfTex[target];
-        g_units[units[target]].sampler = 0;
-    }
+    for (int target = 0; target < 3; target++) bind_unit_2d(units[target], g_halfTex[target]);
     r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
     r_glUniform1i(program->locVLPass, 2);
     if (program->locVLReady >= 0) r_glUniform1i(program->locVLReady, 1);
@@ -2709,6 +2737,8 @@ static void check_extras(GLuint prog, ProgRec *p)
     if (locAO >= 0) r_glUniform1i(locAO, AO_UNIT);
     GLint locGI = r_glGetUniformLocation(prog, "uHookGI");
     if (locGI >= 0) r_glUniform1i(locGI, GI_UNIT);
+    p->locHitLight = r_glGetUniformLocation(prog, "uHookHitLight");
+    if (p->locHitLight >= 0) r_glUniform1i(p->locHitLight, HIT_UNIT);
     p->locVLReady = r_glGetUniformLocation(prog, "uHookVLReady");
     if (p->locVLPass >= 0 || p->locVLReady >= 0) p->hasExtras = 1;
     p->giDenoise = r_glGetUniformLocation(prog, "auGIRaw") >= 0;

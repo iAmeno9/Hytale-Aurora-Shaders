@@ -65,6 +65,7 @@ uniform int uHookVLPass;    // 1: this draw only traces the light shafts, GTAO, 
 #if AU_HALF_RES_GI
 layout(location = 2) out vec4 outGI;   // half-resolution pass: screen-space GI (rgb) and its occlusion (a)
 uniform sampler2D uHookGI;
+uniform sampler2D uHookHitLight;       // the light each surface gives off, cached by pass 3 for the GI's rays
 #endif
 #if AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
 layout(location = 1) out vec4 outAO;   // half-resolution pass: GTAO bent normal (octahedral, rg), visibility (b), cloud shadow (a)
@@ -247,9 +248,33 @@ vec3 AU_GIHitLightData(vec2 uv, out vec2 albedoSky)
 
 vec3 AU_GIHitLight(vec2 uv)
 {
+#if AU_HALF_RES_GI
+    // The half-resolution GI pass reads it from the cache pass 3 filled, once per texel, instead of
+    // working it out again for each of its rays.
+    if (uHookVLPass == 1) return textureLod(uHookHitLight, uv, 0.0).rgb;
+#endif
     vec2 albedoSky;
     return AU_GIHitLightData(uv, albedoSky);
 }
+
+#if AU_HALF_RES_GI
+// Pass 3: the light the nearest of the four pixels each texel covers gives off, as a GI ray that
+// hits it sees it.
+vec4 AU_TraceHitLight()
+{
+    ivec2 size = textureSize(uDepthTexture, 0);
+    ivec2 corner = ivec2(gl_FragCoord.xy) * 2, pixel = corner;
+    float depth = 2.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 candidate = min(corner + ivec2(k & 1, k >> 1), size - 1);
+        float candidateDepth = texelFetch(uDepthTexture, candidate, 0).r;
+        if (candidateDepth < depth) { depth = candidateDepth; pixel = candidate; }
+    }
+    if (depth >= 1.0) return vec4(0.0);
+    vec2 albedoSky;
+    return vec4(min(AU_GIHitLightData((vec2(pixel) + 0.5) / vec2(size), albedoSky), vec3(1.5)), 1.0);
+}
+#endif
 
 // For the path tracer's sky light: albedo luminance and Hytale sky light of an on-screen
 // surface (the sky light it passes on when a ray hits it).
@@ -307,6 +332,9 @@ void main()
     AU_InitCommon();
 #if AU_LIGHTSHAFTS || AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
     if (uHookVLPass == 1) { outColor = AU_TraceHalfResVL(); return; }
+#endif
+#if AU_HALF_RES_GI
+    if (uHookVLPass == 3) { outColor = AU_TraceHitLight(); return; }
 #endif
 #if AU_SKY_LIGHTING == 1
     for (int face = 0; face < 6; face++) auSkyCube[face] = auSkyLightCube[face];
