@@ -502,9 +502,9 @@ typedef struct {
     GLint locCurrentProjection;
     GLint locGICompact, locGISourceSize, locGIPreviousInverse, locGIPreviousDepth;
     GLint locVoxGeo, locVoxCol;
-    GLint locVLPass;         // uHookVLPass: DeferredFS traces the light shafts at half resolution
-    GLint locVLReady;        // uHookVLReady: those shafts are in uHookVL (DeferredFS, water)
-    GLint locHitLight;       // uHookHitLight: the program first fills the GI's hit-light cache (uHookVLPass 3)
+    GLint locHalfResPass;    // uHookHalfResPass: the program traces its costly parts at half resolution first (half_res_prepass)
+    GLint locVLReady;        // uHookVLReady: uHookVL holds DeferredFS's light shafts (SkyFS, water)
+    GLint locHitLight;       // uHookHitLight: the program also caches the light surfaces give off, for the GI (pass 3)
     GLint locNativeEmission;
     GLint locMaterialLOD;
     GLint locJitter, locUIFragmentScale;
@@ -991,10 +991,11 @@ static int relink_program(GLuint prog, ProgRec *p, int useOverrides)
 #define HOOK_UNIT_BASE 16
 #endif
 #define MAX_UNITS 48
-#define VL_UNIT 36   // half-resolution light shafts; GL 4.1 guarantees 80 combined units
-#define AO_UNIT 37   // half-resolution GTAO, from the same pass
-#define GI_UNIT 38   // half-resolution screen-space GI, from the same pass
-#define HIT_UNIT 39  // the light each surface gives off, cached at half resolution for the GI's rays
+// half_res_prepass targets; GL 4.1 guarantees 80 combined units.
+#define VL_UNIT 36   // light shafts, or DeferredShadowFS's contact shadows
+#define AO_UNIT 37   // GTAO and cloud shadows
+#define GI_UNIT 38   // screen-space GI
+#define HIT_UNIT 39  // the GI's hit-light cache
 typedef struct { GLenum target; GLuint tex; GLuint sampler; } UnitState;
 static UnitState g_units[MAX_UNITS];
 static GLuint g_activeUnit;
@@ -1146,7 +1147,7 @@ static void gi_bind(int temporal, int raw, int divisor, int compact, int lights)
 static void profile_use(const char *name);
 static void gi_release(void);
 static void gi_draw(GLenum mode, GLint first, GLsizei count);
-static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count);
+static void half_res_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count);
 static GLuint g_dlssProg; // the program writing the DLSS inputs (PostEffectFS, see dlss_draw)
 static int g_dlssRR;
 static int g_dlssPending; // inputs written this frame, DLSS runs at the present (dlss_present)
@@ -1189,7 +1190,7 @@ AU_GL_EXPORT void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
     if (program) temporal_prepare(program);
     share_draw_capture();
     if (g_matProgRec) materials_draw_check();
-    if (program && program->locVLPass >= 0) vl_prepass(program, mode, first, count);
+    if (program && program->locHalfResPass >= 0) half_res_prepass(program, mode, first, count);
     if (g_giProg && g_giProg == g_curProg) { gi_draw(mode, first, count); return; }
     if (g_dlssProg && g_dlssProg == g_curProg) { dlss_draw(mode, first, count); return; }
     if (g_dlssPending && dlss_present()) return;
@@ -1665,19 +1666,21 @@ static void gi_draw(GLenum mode, GLint first, GLsizei count)
     r_glUniform1i(program->locPTPass, 0);
     if (program->locLocalLightTiles >= 0) r_glUniform1i(program->locLocalLightTiles, 0);
 }
-// Half-resolution passes for any program with uHookVLPass: one extra draw of it (uHookVLPass 1)
-// traces only its soft, costly parts into two half-size targets, and the real draw (uHookVLPass 2)
+// Half-resolution passes for any program with uHookHalfResPass: one extra draw of it (pass 1)
+// traces only its soft, costly parts into three half-size targets, and the real draw (pass 2)
 // upsamples them by depth; 0 = trace per pixel as before. DeferredShadowFS traces its contact
 // shadows; DeferredFS, later in the frame, its light shafts, GTAO, cloud shadows and screen-space GI.
-// A program with uHookHitLight first draws once more (uHookVLPass 3) into a fourth half-size target
-// of its own: the light each surface gives off, which the GI's rays then read instead of the G-buffer.
-#define VL_GL_BLEND 0x0BE2
-#define VL_GL_SCISSOR_TEST 0x0C11
-#define VL_GL_DRAW_FRAMEBUFFER 0x8CA9
-#define VL_GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
-#define VL_GL_COLOR_ATTACHMENT0 0x8CE0
-static GLuint g_halfTex[3], g_vlFbo;   // light shafts (RGBA16F), GTAO (RGBA8), GI (RGBA16F)
-static GLuint g_hitTex, g_hitFbo;       // the GI's hit-light cache (RGBA16F)
+// A program with uHookHitLight first draws once more (pass 3) into a fourth half-size target of its
+// own: the light each surface gives off, which the GI's rays then read instead of the G-buffer.
+#define GL_BLEND 0x0BE2
+#define GL_SCISSOR_TEST 0x0C11
+#define GL_DRAW_FRAMEBUFFER_ 0x8CA9
+#define GL_DRAW_FRAMEBUFFER_BINDING_ 0x8CA6
+#define GL_COLOR_ATTACHMENT0_ 0x8CE0
+#define GL_FRAMEBUFFER_COMPLETE_ 0x8CD5
+static GLuint g_halfTex[4];   // light shafts (RGBA16F), GTAO (RGBA8), GI (RGBA16F), hit-light cache (RGBA16F)
+static GLuint g_halfFbo, g_hitFbo;
+static int g_halfW, g_halfH;
 
 static void bind_unit_2d(int unit, GLuint texture)
 {
@@ -1688,9 +1691,8 @@ static void bind_unit_2d(int unit, GLuint texture)
     g_units[unit].tex = texture;
     g_units[unit].sampler = 0;
 }
-static int g_vlW, g_vlH;
 
-static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count)
+static void half_res_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count)
 {
     static void (APIENTRY *genFramebuffers)(GLsizei, GLuint *), (APIENTRY *bindFramebuffer)(GLenum, GLuint);
     static void (APIENTRY *framebufferTexture)(GLenum, GLenum, GLenum, GLuint, GLint);
@@ -1710,21 +1712,19 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
         enable = (void *)GetProcAddress(g_real, "glEnable");
         disable = (void *)GetProcAddress(g_real, "glDisable");
     }
-    r_glUniform1i(program->locVLPass, 0);
+    r_glUniform1i(program->locHalfResPass, 0);
     GLint viewport[4], drawFramebuffer = 0;
     r_glGetIntegerv(GL_VIEWPORT, viewport);
     int width = (viewport[2] + 1) / 2, height = (viewport[3] + 1) / 2;
     if (!genFramebuffers || !bindFramebuffer || !framebufferTexture || !drawBuffers || !checkFramebuffer || width <= 0 || height <= 0) return;
-    r_glGetIntegerv(VL_GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
-    if (width != g_vlW || height != g_vlH) {
+    r_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_, &drawFramebuffer);
+    if (width != g_halfW || height != g_halfH) {
         PFN_glGenTextures gen = (PFN_glGenTextures)GetProcAddress(g_real, "glGenTextures");
         PFN_glTexImage2D image = (PFN_glTexImage2D)GetProcAddress(g_real, "glTexImage2D");
         PFN_glTexParameteri parameter = (PFN_glTexParameteri)GetProcAddress(g_real, "glTexParameteri");
         GLint previousTexture = 0;
         r_glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
-        if (!g_vlFbo) genFramebuffers(1, &g_vlFbo);
-        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
-        for (int target = 0; target < 3; target++) {
+        for (int target = 0; target < 4; target++) {
             if (!g_halfTex[target]) gen(1, &g_halfTex[target]);
             r_glBindTexture(GL_TEXTURE_2D, g_halfTex[target]);
             if (target == 1) image(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
@@ -1732,55 +1732,51 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             parameter(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-            framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0 + target, GL_TEXTURE_2D, g_halfTex[target], 0);
         }
-        static const GLenum targets[3] = {VL_GL_COLOR_ATTACHMENT0, VL_GL_COLOR_ATTACHMENT0 + 1, VL_GL_COLOR_ATTACHMENT0 + 2};
-        drawBuffers(3, targets);
-        int complete = checkFramebuffer(VL_GL_DRAW_FRAMEBUFFER) == 0x8CD5;   // GL_FRAMEBUFFER_COMPLETE
-        if (!g_hitTex) gen(1, &g_hitTex);
-        if (!g_hitFbo) genFramebuffers(1, &g_hitFbo);
-        r_glBindTexture(GL_TEXTURE_2D, g_hitTex);
-        image(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
-        parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        parameter(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
-        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_hitFbo);
-        framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, g_hitTex, 0);
-        complete = complete && checkFramebuffer(VL_GL_DRAW_FRAMEBUFFER) == 0x8CD5;
         r_glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
-        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
-        g_vlW = complete ? width : 0;
-        g_vlH = complete ? height : 0;
+        if (!g_halfFbo) genFramebuffers(1, &g_halfFbo);
+        if (!g_hitFbo) genFramebuffers(1, &g_hitFbo);
+        bindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_halfFbo);
+        for (int target = 0; target < 3; target++)
+            framebufferTexture(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_ + target, GL_TEXTURE_2D, g_halfTex[target], 0);
+        static const GLenum targets[3] = {GL_COLOR_ATTACHMENT0_, GL_COLOR_ATTACHMENT0_ + 1, GL_COLOR_ATTACHMENT0_ + 2};
+        drawBuffers(3, targets);
+        int complete = checkFramebuffer(GL_DRAW_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_;
+        bindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_hitFbo);
+        framebufferTexture(GL_DRAW_FRAMEBUFFER_, GL_COLOR_ATTACHMENT0_, GL_TEXTURE_2D, g_halfTex[3], 0);
+        complete = complete && checkFramebuffer(GL_DRAW_FRAMEBUFFER_) == GL_FRAMEBUFFER_COMPLETE_;
+        bindFramebuffer(GL_DRAW_FRAMEBUFFER_, (GLuint)drawFramebuffer);
+        g_halfW = complete ? width : 0;
+        g_halfH = complete ? height : 0;
         logf_("half-resolution targets: %dx%d %s", width, height, complete ? "ready" : "unavailable");
         if (!complete) return;
     }
-    GLboolean blend = isEnabled(VL_GL_BLEND), scissor = isEnabled(VL_GL_SCISSOR_TEST);
+    GLboolean blend = isEnabled(GL_BLEND), scissor = isEnabled(GL_SCISSOR_TEST);
     // None of the half-size textures may stay bound for sampling while it is a draw's target.
-    static const int units[3] = {VL_UNIT, AO_UNIT, GI_UNIT};
-    for (int target = 0; target < 3; target++) bind_unit_2d(units[target], 0);
-    bind_unit_2d(HIT_UNIT, 0);
+    static const int units[4] = {VL_UNIT, AO_UNIT, GI_UNIT, HIT_UNIT};
+    for (int target = 0; target < 4; target++) bind_unit_2d(units[target], 0);
     setViewport(0, 0, width, height);
-    if (blend) disable(VL_GL_BLEND);
-    if (scissor) disable(VL_GL_SCISSOR_TEST);
+    if (blend) disable(GL_BLEND);
+    if (scissor) disable(GL_SCISSOR_TEST);
     if (program->locHitLight >= 0) {
-        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_hitFbo);
+        bindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_hitFbo);
         profile_use("Half-res hit light");
-        r_glUniform1i(program->locVLPass, 3);
+        r_glUniform1i(program->locHalfResPass, 3);
         r_glDrawArrays(mode, first, count);
-        bind_unit_2d(HIT_UNIT, g_hitTex);
+        bind_unit_2d(HIT_UNIT, g_halfTex[3]);
     }
-    bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
+    bindFramebuffer(GL_DRAW_FRAMEBUFFER_, g_halfFbo);
     profile_use("Half-res pass");
-    r_glUniform1i(program->locVLPass, 1);
+    r_glUniform1i(program->locHalfResPass, 1);
     r_glDrawArrays(mode, first, count);
-    bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
+    bindFramebuffer(GL_DRAW_FRAMEBUFFER_, (GLuint)drawFramebuffer);
     setViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-    if (blend) enable(VL_GL_BLEND);
-    if (scissor) enable(VL_GL_SCISSOR_TEST);
+    if (blend) enable(GL_BLEND);
+    if (scissor) enable(GL_SCISSOR_TEST);
     profile_use(program->pname);
     for (int target = 0; target < 3; target++) bind_unit_2d(units[target], g_halfTex[target]);
     r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
-    r_glUniform1i(program->locVLPass, 2);
+    r_glUniform1i(program->locHalfResPass, 2);
     if (program->locVLReady >= 0) r_glUniform1i(program->locVLReady, 1);
 }
 
@@ -2161,10 +2157,8 @@ __attribute__((used)) static const char linux_dlss_marker[] = "AURORA_LINUX_DLSS
 #define GL_R32F 0x822E
 #define GL_RG16F 0x822F
 #define GL_COLOR_BUFFER_BIT 0x4000
-#define GL_SCISSOR_TEST 0x0C11
 #define GL_READ_FRAMEBUFFER_BINDING_ 0x8CAA
 #define GL_READ_FRAMEBUFFER_ 0x8CA8
-#define GL_COLOR_ATTACHMENT0_ 0x8CE0
 #define DLSS_IMG_COLOR 2
 #define DLSS_IMG_DEPTH 3
 #define DLSS_IMG_MOTION 4
@@ -2730,7 +2724,7 @@ static void check_extras(GLuint prog, ProgRec *p)
     p->usesGI = 0;
     p->locPTPass = r_glGetUniformLocation(prog, "uHookPTPass");
     p->locLocalLightTiles = r_glGetUniformLocation(prog, "uHookLocalLightTiles");
-    p->locVLPass = r_glGetUniformLocation(prog, "uHookVLPass");
+    p->locHalfResPass = r_glGetUniformLocation(prog, "uHookHalfResPass");
     GLint locVL = r_glGetUniformLocation(prog, "uHookVL");
     if (locVL >= 0) r_glUniform1i(locVL, VL_UNIT);
     GLint locAO = r_glGetUniformLocation(prog, "uHookAO");
@@ -2740,7 +2734,7 @@ static void check_extras(GLuint prog, ProgRec *p)
     p->locHitLight = r_glGetUniformLocation(prog, "uHookHitLight");
     if (p->locHitLight >= 0) r_glUniform1i(p->locHitLight, HIT_UNIT);
     p->locVLReady = r_glGetUniformLocation(prog, "uHookVLReady");
-    if (p->locVLPass >= 0 || p->locVLReady >= 0) p->hasExtras = 1;
+    if (p->locHalfResPass >= 0 || p->locVLReady >= 0) p->hasExtras = 1;
     p->giDenoise = r_glGetUniformLocation(prog, "auGIRaw") >= 0;
     p->giTemporal = r_glGetUniformLocation(prog, "auGIHist") >= 0;
     p->giLegacy = p->giTemporal && !p->giDenoise;
@@ -2850,7 +2844,7 @@ static void apply_extras(ProgRec *p)
         if (g_postPresent || !temporal_geometry(p)) r_glUniform2f(p->locJitter, 0.0f, 0.0f);
         else r_glUniform2f(p->locJitter, g_jitterNdc[0], g_jitterNdc[1]);
     }
-    if (p->locVLReady >= 0) r_glUniform1i(p->locVLReady, g_vlW > 0);
+    if (p->locVLReady >= 0) r_glUniform1i(p->locVLReady, g_halfW > 0);
     if (p->usesGI) g_giProg = g_curProg;
     if (p->usesDlss) g_dlssProg = g_curProg;
     if (p->locFrame >= 0) r_glUniform1i(p->locFrame, g_frame);

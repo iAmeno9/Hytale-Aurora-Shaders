@@ -87,12 +87,11 @@ float ContactShadow(vec3 pos, vec3 normalWS, vec3 planeN, vec3 toSun, float dith
 }
 
 #if AU_CONTACT_SHADOWS
-uniform int uHookVLPass;   // 1: this draw only traces the contact shadows, at half resolution; 2: they are in uHookVL
-uniform sampler2D uHookVL;
+uniform int uHookHalfResPass;   // 1: this draw only traces the contact shadows, at half resolution; 2: they are in uHookVL
+uniform sampler2D uHookVL;      // pass 1's output; DeferredFS reuses the target for its light shafts
 
-// Half-resolution pass (the hook's, which DeferredFS uses later in the frame for its light shafts):
-// each texel traces the contact shadow of the nearest of the four pixels it covers. x: 1 lit,
-// 0 shadowed; y: that pixel's view distance, -1 for sky.
+// Pass 1: each texel traces the contact shadow of the nearest of the four pixels it covers.
+// x: 1 lit, 0 shadowed; y: that pixel's view distance, -1 for sky.
 vec4 AU_TraceHalfResContact()
 {
     ivec2 size = textureSize(uDepthTexture, 0);
@@ -175,7 +174,7 @@ float FarShadow(vec3 pos, vec3 toSun, float dither, bool foliage)
 void main()
 {
 #if AU_CONTACT_SHADOWS
-    if (uHookVLPass == 1) { outColor = AU_TraceHalfResContact(); return; }
+    if (uHookHalfResPass == 1) { outColor = AU_TraceHalfResContact(); return; }
 #endif
     float depth = texture(uDepthTexture, fragTexCoords).r;
     if (depth >= 1.0) discard;
@@ -229,8 +228,9 @@ void main()
     float radius = 2.2 * AU_SHADOW_SOFTNESS / (1.0 + 0.6 * float(cascade));
     vec2 filterRadius = vec2(radius);
     float rot = 6.2831853 * BlueNoise(gl_FragCoord.xy, 1);
-    // The Vogel disk turns by the golden angle per sample: rotate a direction instead of sin/cos each time.
-    const vec2 golden = vec2(-0.7373688, 0.6754903);   // cos, sin of 2.39996323
+    // The Vogel disk turns by the golden angle (2.39996323) per sample: rotate a direction instead
+    // of taking sin and cos each time.
+    const mat2 goldenTurn = mat2(-0.7373688, 0.6754903, -0.6754903, -0.7373688);
     float cascadeMinX = cascadeScale * float(cascade) + texel.x * 2.0;
     float cascadeMaxX = cascadeScale * float(cascade + 1) - texel.x * 2.0;
 
@@ -260,7 +260,7 @@ void main()
         float blockers = 0.0;
         float searchR = AU_PCSS_SEARCH / (1.0 + 0.6 * float(cascade));
         vec2 direction = vec2(cos(rot + 1.3), sin(rot + 1.3));
-        for (int i = 0; i < 10; i++, direction = vec2(direction.x * golden.x - direction.y * golden.y, direction.x * golden.y + direction.y * golden.x)) {
+        for (int i = 0; i < 10; i++, direction = goldenTurn * direction) {
             float r = sqrt((float(i) + 0.5) / 10.0);
             vec2 o = direction * r * searchR * texel;
             vec2 suv = vec2(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y);
@@ -294,11 +294,11 @@ void main()
         // Every stride-th sample first: 8 spread over the whole disk. Most points are fully lit or
         // fully shadowed, and for those the other samples would only agree.
         const int stride = AU_SHADOW_SAMPLES / 8;
-        float strideAngle = float(stride) * 2.39996323;
-        vec2 strideTurn = vec2(cos(strideAngle), sin(strideAngle));
-        vec2 probeDirection = vec2(cos(rot + float(stride - 1) * 2.39996323), sin(rot + float(stride - 1) * 2.39996323));
+        float strideAngle = float(stride) * 2.39996323, probeAngle = rot + float(stride - 1) * 2.39996323;
+        mat2 strideTurn = mat2(cos(strideAngle), sin(strideAngle), -sin(strideAngle), cos(strideAngle));
+        vec2 probeDirection = vec2(cos(probeAngle), sin(probeAngle));
         probe = 0.0;
-        for (int k = 0; k < 8; k++, probeDirection = vec2(probeDirection.x * strideTurn.x - probeDirection.y * strideTurn.y, probeDirection.x * strideTurn.y + probeDirection.y * strideTurn.x)) {
+        for (int k = 0; k < 8; k++, probeDirection = strideTurn * probeDirection) {
             vec2 o = probeDirection * sqrt((float(k * stride + stride - 1) + 0.5) / float(AU_SHADOW_SAMPLES)) * filterRadius * texel;
             probe += texture(uShadowMap, vec3(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y, uvw.z - 0.0001));
         }
@@ -307,7 +307,7 @@ void main()
             visibility = probe / 8.0;
         } else {
             vec2 direction = vec2(cos(rot), sin(rot));
-            for (int i = 0; i < AU_SHADOW_SAMPLES; i++, direction = vec2(direction.x * golden.x - direction.y * golden.y, direction.x * golden.y + direction.y * golden.x)) {
+            for (int i = 0; i < AU_SHADOW_SAMPLES; i++, direction = goldenTurn * direction) {
                 float r = sqrt((float(i) + 0.5) / float(AU_SHADOW_SAMPLES));
                 vec2 o = direction * r * filterRadius * texel;
                 vec2 suv = vec2(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y);
@@ -338,7 +338,7 @@ void main()
     float contactDist = min(AU_CONTACT_SHADOW_DISTANCE, farCascade);
     vec3 planeN = fastNormalFromPosition(positionNoBias);   // screen derivatives: outside the branch
     if (visibility > 0.01 && lView < contactDist && !backLit) {
-        float contact = uHookVLPass == 2 ? AU_UpsampleContact(fragTexCoords, lView) : -1.0;
+        float contact = uHookHalfResPass == 2 ? AU_UpsampleContact(fragTexCoords, lView) : -1.0;
         if (contact < 0.0) contact = ContactShadow(positionNoBias, normalWS, planeN, -lightDir, dither);
 #if AU_POLISH_ENABLE && AU_POLISH_SUNLIGHT && AU_POLISH_SUN_SHADOWS
         contact = mix(1.0, contact, mix(1.0, clamp(AU_POLISH_CONTACT_WEIGHT, 0.0, 1.0), sunlightWeight));

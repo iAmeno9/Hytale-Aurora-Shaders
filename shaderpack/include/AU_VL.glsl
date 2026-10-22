@@ -15,7 +15,7 @@ vec3 AU_AddVL(vec3 color, vec3 vl)
 }
 
 uniform sampler2D uHookVL;  // DeferredFS's half-resolution shafts (rgb) and the view distance traced to (a, -1 for sky)
-uniform int uHookVLReady;   // the hook ran that pass this frame
+uniform int uHookVLReady;   // 1 once the hook has made its half-resolution targets
 
 // The four nearest half-resolution texels. A surface (lViewPos > 0) weights them by how close the
 // distance each one traced is to its own. Where none saw a surface (thin geometry, water over a bed
