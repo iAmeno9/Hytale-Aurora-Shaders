@@ -168,20 +168,40 @@ void main()
     float radius = 2.2 * AU_SHADOW_SOFTNESS / (1.0 + 0.6 * float(cascade));
     vec2 filterRadius = vec2(radius);
     float rot = 6.2831853 * BlueNoise(gl_FragCoord.xy, 1);
+    // The Vogel disk turns by the golden angle per sample: rotate a direction instead of sin/cos each time.
+    const vec2 golden = vec2(-0.7373688, 0.6754903);   // cos, sin of 2.39996323
     float cascadeMinX = cascadeScale * float(cascade) + texel.x * 2.0;
     float cascadeMaxX = cascadeScale * float(cascade + 1) - texel.x * 2.0;
+
+    float faceLight = 1.0;
+#if USE_CLEAN_BACKFACES
+    // Faces turned away from the sun are dark; the lighting's N.L handles the gradient.
+    float nDotL = dot(normalWS, lightDir);
+    backLit = useCleanShadowBackfaces && nDotL >= 0.0;
+    if (backLit) faceLight = 0.0;
+    // Sun at a grazing angle on a block face: the shadow map can't resolve it - each cascade
+    // refit shifts the lit sliver along the wall (a sun streak through a roof gap that slid
+    // around as the camera moved) - and the real light there is tiny. Fade it out, measured
+    // on the block face rather than the bumpy generated normal.
+    if (useCleanShadowBackfaces) {
+        vec3 an = abs(normalWS);
+        vec3 faceN = an.y >= max(an.x, an.z) ? vec3(0.0, sign(normalWS.y), 0.0)
+                   : (an.z >= an.x ? vec3(0.0, 0.0, sign(normalWS.z)) : vec3(sign(normalWS.x), 0.0, 0.0));
+        faceLight *= smoothstep(0.1, 0.16, -dot(faceN, lightDir));
+    }
+#endif
 
     float blockerFrac = 0.0;
 #if AU_PCSS
     // Contact-hardening shadows: average blocker depth -> penumbra width.
-    {
+    if (faceLight > 0.0) {
         float blockerSum = 0.0;
         float blockers = 0.0;
         float searchR = AU_PCSS_SEARCH / (1.0 + 0.6 * float(cascade));
-        for (int i = 0; i < 10; i++) {
+        vec2 direction = vec2(cos(rot + 1.3), sin(rot + 1.3));
+        for (int i = 0; i < 10; i++, direction = vec2(direction.x * golden.x - direction.y * golden.y, direction.x * golden.y + direction.y * golden.x)) {
             float r = sqrt((float(i) + 0.5) / 10.0);
-            float a = float(i) * 2.39996323 + rot + 1.3;
-            vec2 o = vec2(cos(a), sin(a)) * r * searchR * texel;
+            vec2 o = direction * r * searchR * texel;
             vec2 suv = vec2(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y);
             float d = texture(uHookShadowDepth, suv).r;
             if (d < uvw.z - 0.0003) { blockerSum += d; blockers += 1.0; }
@@ -207,36 +227,37 @@ void main()
     }
 #endif
     visibility = 0.0;
-    if (blockerFrac < 0.95) {
-        for (int i = 0; i < AU_SHADOW_SAMPLES; i++) {
-            float r = sqrt((float(i) + 0.5) / float(AU_SHADOW_SAMPLES));
-            float a = float(i) * 2.39996323 + rot;
-            vec2 o = vec2(cos(a), sin(a)) * r * filterRadius * texel;
-            vec2 suv = vec2(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y);
-            visibility += texture(uShadowMap, vec3(suv, uvw.z - 0.0001));
+    if (faceLight > 0.0 && blockerFrac < 0.95) {
+        float probe = 4.0;   // neither 0 nor 8: fewer than 16 samples always run the full filter
+#if AU_SHADOW_SAMPLES >= 16
+        // Every stride-th sample first: 8 spread over the whole disk. Most points are fully lit or
+        // fully shadowed, and for those the other samples would only agree.
+        const int stride = AU_SHADOW_SAMPLES / 8;
+        float strideAngle = float(stride) * 2.39996323;
+        vec2 strideTurn = vec2(cos(strideAngle), sin(strideAngle));
+        vec2 probeDirection = vec2(cos(rot + float(stride - 1) * 2.39996323), sin(rot + float(stride - 1) * 2.39996323));
+        probe = 0.0;
+        for (int k = 0; k < 8; k++, probeDirection = vec2(probeDirection.x * strideTurn.x - probeDirection.y * strideTurn.y, probeDirection.x * strideTurn.y + probeDirection.y * strideTurn.x)) {
+            vec2 o = probeDirection * sqrt((float(k * stride + stride - 1) + 0.5) / float(AU_SHADOW_SAMPLES)) * filterRadius * texel;
+            probe += texture(uShadowMap, vec3(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y, uvw.z - 0.0001));
         }
-        visibility /= float(AU_SHADOW_SAMPLES);
+#endif
+        if (probe == 0.0 || probe == 8.0) {
+            visibility = probe / 8.0;
+        } else {
+            vec2 direction = vec2(cos(rot), sin(rot));
+            for (int i = 0; i < AU_SHADOW_SAMPLES; i++, direction = vec2(direction.x * golden.x - direction.y * golden.y, direction.x * golden.y + direction.y * golden.x)) {
+                float r = sqrt((float(i) + 0.5) / float(AU_SHADOW_SAMPLES));
+                vec2 o = direction * r * filterRadius * texel;
+                vec2 suv = vec2(clamp(uvw.x + o.x, cascadeMinX, cascadeMaxX), uvw.y + o.y);
+                visibility += texture(uShadowMap, vec3(suv, uvw.z - 0.0001));
+            }
+            visibility /= float(AU_SHADOW_SAMPLES);
+        }
     }
     // Nearly every blocker-search sample occluded: the point is deep in shadow. A wide penumbra
     // (from a far blocker) would otherwise smear a one-texel corner leak into a lit band.
-    visibility = min(visibility, 1.0 - smoothstep(0.75, 0.95, blockerFrac));
-
-#if USE_CLEAN_BACKFACES
-    // Faces turned away from the sun are dark; the lighting's N.L handles the gradient.
-    float nDotL = dot(normalWS, lightDir);
-    backLit = useCleanShadowBackfaces && nDotL >= 0.0;
-    if (backLit) visibility = 0.0;
-    // Sun at a grazing angle on a block face: the shadow map can't resolve it - each cascade
-    // refit shifts the lit sliver along the wall (a sun streak through a roof gap that slid
-    // around as the camera moved) - and the real light there is tiny. Fade it out, measured
-    // on the block face rather than the bumpy generated normal.
-    if (useCleanShadowBackfaces) {
-        vec3 an = abs(normalWS);
-        vec3 faceN = an.y >= max(an.x, an.z) ? vec3(0.0, sign(normalWS.y), 0.0)
-                   : (an.z >= an.x ? vec3(0.0, 0.0, sign(normalWS.z)) : vec3(sign(normalWS.x), 0.0, 0.0));
-        visibility *= smoothstep(0.1, 0.16, -dot(faceN, lightDir));
-    }
-#endif
+    visibility = min(visibility, 1.0 - smoothstep(0.75, 0.95, blockerFrac)) * faceLight;
 
     // Fade out at the edge of the last cascade - only out where the shadow range ends; nearby
     // points can land in the last cascade too, and fading them lit drew moving light strips.
