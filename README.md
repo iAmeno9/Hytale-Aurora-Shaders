@@ -299,8 +299,8 @@ These only apply with the **RTX** preset.
 | Option | What it does |
 |---|---|
 | **Bounce light** | Sunlight bouncing off surfaces: shade under a tree picks up green from the sunlit grass, a room fills with warm light from a sunlit floor, torch flames light the walls around them. |
-| **Bounce rays** | How many rays per pixel the bounce light uses. More is smoother but slower; this is the biggest performance setting in the pack. |
-| **Bounce reach** | How far (in blocks) bounced light travels. |
+| **Screen-space rays** | How many rays the bounce light traces when Path tracing is off. More is smoother but slower; this is the biggest performance setting in the pack. |
+| **Screen-space reach** | How far (in blocks) bounced light travels. |
 | **Ray-traced AO** | How much those rays also darken enclosed corners and the shade under overhangs. |
 
 ### Sky & atmosphere
@@ -377,11 +377,17 @@ step and fade where screen space runs out. [Details](docs/surfaces-and-water.md#
 
 ## Performance
 
-The biggest costs, roughly in order: the **RTX** preset (try fewer **Bounce rays** first),
+The biggest costs, roughly in order: the **RTX** preset (try fewer **Screen-space rays** first),
 **Volumetric clouds**, **Light shafts**, and **Shader water** reflections. Non-RTX profiles
 use the lighter lighting path; lower quality levels reduce the other costs. The newer looks are
-light: on an RTX 5080 at 1440p, GTAO at Medium adds about 0.3 ms and Ground mist about 0.5 ms
-([GTAO](docs/surfaces-and-water.md#ambient-occlusion), [sky effects](docs/clouds-and-sky.md#cost)).
+light: on an RTX 5080 at 1440p, Ground mist adds about 0.5 ms, and GTAO at Medium added about
+0.3 ms before it moved to half resolution ([GTAO](docs/surfaces-and-water.md#ambient-occlusion),
+[sky effects](docs/clouds-and-sky.md#cost)). Mac measurements are in the
+[macOS notes](docs/macos.md#performance).
+
+To see where the time goes, create an empty file named `_profile` in `shaderpack/programs`. The
+hook deletes it, times the next frame on the GPU and writes each pass's milliseconds to
+`hook.log`, slowest first. Single frames vary, so take a few profiles before comparing settings.
 
 ## Build it yourself
 

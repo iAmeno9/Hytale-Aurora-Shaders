@@ -4,11 +4,12 @@
 
 - Added macOS support on Apple Silicon. `./install.sh` builds the SDL3 hook for the native client, installs it inside `Hytale.app` and re-signs the app so the game can load it; `./install.sh --uninstall` restores Hypixel's signature. Colored area lights, Coloured light fog, Path tracing, voxel scattering, GI denoising and DLSS stay off on macOS, whose OpenGL 4.1 has no image load/store. See [macOS notes](docs/macos.md).
 - The Linux hook now advances its frame counter every frame, as the Windows hook does. Before, temporal reprojection kept the first frame's camera and `uHookFrame` stayed at 0.
-- Light shafts, GTAO, cloud shadows, contact shadows and the RTX preset's screen-space GI are traced at half resolution and upsampled by depth, and the water and the sky reuse those shafts instead of tracing their own. On an M4 Pro at 4112x2516 this saved 8.5 ms per frame for the shafts, 7.1 ms for GTAO, 1.0 ms for cloud shadows, 1.4 ms for contact shadows and 47.8 ms for the GI. With the GI denoiser on, the GI stays per pixel.
+- Light shafts, GTAO, cloud shadows and contact shadows are traced at half resolution and upsampled by depth, and the sky and the water reuse the shafts instead of tracing their own. On an M4 Pro at 4112x2516 this saved 8.5 ms per frame for the shafts, 7.1 ms for GTAO, 1.0 ms for cloud shadows and 1.4 ms for contact shadows.
+- With the RTX preset and the GI denoiser off, as on macOS, the screen-space GI is traced at half resolution too, and its rays read the light of the surfaces they hit from a half-resolution cache. On the same Mac at 16 rays, the half-resolution GI saved 47.8 ms of a 106 ms frame, and the cache 5.0 ms more.
 - The sun shadow filter takes 8 of its samples first, spread over the disk, and stops there when they agree, as they do everywhere outside a penumbra. Block faces turned away from the sun skip it. The shadow pass went from 6.5 to 4.6 ms.
 - With GTAO on, the installer patches Hytale's SSAO to skip the surfaces GTAO covers; foliage and two-sided models still use it. That pass went from 2.75 to 1.18 ms.
 - Cloud shadows on the ground sample two noise octaves instead of four. The two finest only sharpened the shadow's edge.
-- `programs/_profile` reports per-pass GPU times on macOS too, whose OpenGL has no timestamp queries.
+- The per-pass GPU profile ([how to run it](README.md#performance)) now works on macOS, whose OpenGL has no timestamp queries.
 
 ## 1.5.2
 

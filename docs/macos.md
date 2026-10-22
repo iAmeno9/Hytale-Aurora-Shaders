@@ -42,7 +42,7 @@ lights**, **Coloured light fog**, **Path tracing** and the voxel **Scattering me
 history of the Original GI denoiser, and DLSS. On macOS the hook appends `#define`s after
 `AU_Settings.glsl`, as it already does for DLSS, so profiles and menu changes cannot turn them
 back on. Voxel scattering falls back to the surface approximation; screen-space GI still runs,
-smoothed by TAA alone.
+at half resolution, smoothed by TAA alone.
 
 ## Apple's OpenGL
 
@@ -80,7 +80,36 @@ at 0. `SDL_GL_SwapWindow` now advances the counter.
 ## Performance
 
 On a MacBook Pro with an M4 Pro (macOS 27.2, Hytale 0.7.3, game window at 4112×2516), the default
-profile ran at 37-48 fps in a river scene where vanilla ran at 79 fps.
+profile first ran at 37-48 fps in a river scene where vanilla ran at 79 fps. The GPU is the
+limit: the client process uses about a sixth of one CPU core and spends most of each frame
+waiting for it.
+
+At that size, most of the GPU time went into effects that change little from one pixel to the
+next. The hook now gives the lighting pass (DeferredFS) and the sun shadow pass
+(DeferredShadowFS) an extra draw at half size, before the real one. That draw traces those
+effects for the nearest pixel of each 2×2 block, and the real draw blends the four nearest
+results by depth. This happens on every platform; where the hook can't create the half-size
+textures, everything is traced per pixel as before. The GI denoiser never runs on a Mac, so the
+RTX preset's screen-space GI goes through the same pass, and its rays read the light of the
+surfaces they hit from a half-size cache.
+
+Each change was measured against the build before it, in the same scene:
+
+| Change | Saved per frame |
+|---|---|
+| Light shafts at half resolution, reused by the sky and the water | 8.5 ms |
+| GTAO at half resolution | 7.1 ms |
+| Cloud shadows at half resolution | 1.0 ms |
+| Contact shadows at half resolution | 1.4 ms |
+| Sun shadow filter stops after 8 samples where they agree | 1.9 ms |
+| Hytale's SSAO skips the surfaces GTAO covers | 1.6 ms |
+| RTX preset: screen-space GI at half resolution (16 rays) | 47.8 ms |
+| RTX preset: cached light for the GI's rays (16 rays) | 5.0 ms |
+
+With the RTX preset, lower **Screen-space rays** first: at 16 rays the GI took 70 ms of a 106 ms
+frame before it moved to half resolution. To see where your own frame goes, use the profiler
+described under [Performance](../README.md#performance). macOS's OpenGL has no timestamp
+counter, so there the hook times each pass with an elapsed-time query instead.
 
 ## Tested
 
