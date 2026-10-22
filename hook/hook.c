@@ -2725,19 +2725,28 @@ static void apply_extras(ProgRec *p)
 
 // ----------------------------------------------------------------------------------------
 // Profiling: FPS every 10 s in hook.log; programs/_profile logs one frame's GPU time per pass
-// (GL timestamps taken at every program switch).
+// (GL timestamps taken at every program switch; elapsed-time queries where the driver has no
+// timestamp counter, as on macOS).
 
 #define GL_TIMESTAMP 0x8E28
+#define GL_TIME_ELAPSED 0x88BF
+#define GL_QUERY_COUNTER_BITS 0x8864
 #define GL_QUERY_RESULT 0x8866
 #define GL_QUERY_RESULT_AVAILABLE 0x8867
 typedef void (APIENTRY *PFN_glGenQueries)(GLsizei, GLuint *);
 typedef void (APIENTRY *PFN_glQueryCounter)(GLuint, GLenum);
 typedef void (APIENTRY *PFN_glGetQueryObjectui64v)(GLuint, GLenum, uint64_t *);
 typedef void (APIENTRY *PFN_glGetQueryObjectiv)(GLuint, GLenum, GLint *);
+typedef void (APIENTRY *PFN_glGetQueryiv)(GLenum, GLenum, GLint *);
+typedef void (APIENTRY *PFN_glBeginQuery)(GLenum, GLuint);
+typedef void (APIENTRY *PFN_glEndQuery)(GLenum);
+static PFN_glBeginQuery r_glBeginQuery;
+static PFN_glEndQuery r_glEndQuery;
 
 #define PROF_MAX 1024
 static int g_profState;      // 0 idle, 1 armed, 2 recording, 3 collecting
 static int g_profN, g_profWait;
+static int g_profElapsed;    // one GL_TIME_ELAPSED query per pass instead of timestamps
 static GLuint g_profQ[PROF_MAX];
 static char g_profName[PROF_MAX][48];
 static LARGE_INTEGER g_fpsT0;
@@ -2761,9 +2770,16 @@ static void profile_frame_marker(void)
         static PFN_glGenQueries gen;
         if (!gen) gen = (PFN_glGenQueries)real_wglGetProcAddress("glGenQueries");
         if (!g_profQ[0] && gen) gen(PROF_MAX, g_profQ);
+        PFN_glGetQueryiv counterBits = (PFN_glGetQueryiv)real_wglGetProcAddress("glGetQueryiv");
+        r_glBeginQuery = (PFN_glBeginQuery)real_wglGetProcAddress("glBeginQuery");
+        r_glEndQuery = (PFN_glEndQuery)real_wglGetProcAddress("glEndQuery");
+        GLint bits = 64;
+        if (counterBits) counterBits(GL_TIMESTAMP, GL_QUERY_COUNTER_BITS, &bits);
+        g_profElapsed = bits == 0 && r_glBeginQuery && r_glEndQuery;
         g_profState = 2;
         g_profN = 0;
     } else if (g_profState == 2) {
+        if (g_profElapsed && g_profN) r_glEndQuery(GL_TIME_ELAPSED);
         g_profState = 3;
         g_profWait = 0;
     }
@@ -2773,8 +2789,12 @@ static void profile_use(const char *name)
 {
     static PFN_glQueryCounter qc;
     if (!qc) qc = (PFN_glQueryCounter)real_wglGetProcAddress("glQueryCounter");
-    if (g_profState == 2 && g_profN < PROF_MAX && qc) {
-        qc(g_profQ[g_profN], GL_TIMESTAMP);
+    if (g_profState == 2 && g_profN < PROF_MAX && (qc || g_profElapsed)) {
+        if (!g_profElapsed) qc(g_profQ[g_profN], GL_TIMESTAMP);
+        else {
+            if (g_profN) r_glEndQuery(GL_TIME_ELAPSED);
+            r_glBeginQuery(GL_TIME_ELAPSED, g_profQ[g_profN]);
+        }
         snprintf(g_profName[g_profN], 48, "%.47s", name && name[0] ? name : "(other)");
         g_profN++;
     }
@@ -2786,8 +2806,14 @@ static void profile_collect(void)
     static PFN_glGetQueryObjectui64v get;
     if (!get) get = (PFN_glGetQueryObjectui64v)real_wglGetProcAddress("glGetQueryObjectui64v");
     if (!get || g_profN < 2) { g_profState = 0; return; }
-    static uint64_t t[PROF_MAX];
+    static uint64_t t[PROF_MAX + 1];
     for (int i = 0; i < g_profN; i++) get(g_profQ[i], GL_QUERY_RESULT, &t[i]);
+    if (g_profElapsed) {
+        // Durations to running totals, so they read like timestamps below; the last pass is measured too.
+        uint64_t sum = 0;
+        for (int i = 0; i < g_profN; i++) { uint64_t duration = t[i]; t[i] = sum; sum += duration; }
+        t[g_profN++] = sum;
+    }
     // Aggregate durations per program name.
     char names[128][48];
     double ms[128];
