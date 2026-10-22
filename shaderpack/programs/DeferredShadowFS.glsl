@@ -86,6 +86,64 @@ float ContactShadow(vec3 pos, vec3 normalWS, vec3 planeN, vec3 toSun, float dith
     return 1.0;
 }
 
+#if AU_CONTACT_SHADOWS
+uniform int uHookVLPass;   // 1: this draw only traces the contact shadows, at half resolution; 2: they are in uHookVL
+uniform sampler2D uHookVL;
+
+// Half-resolution pass (the hook's, which DeferredFS uses later in the frame for its light shafts):
+// each texel traces the contact shadow of the nearest of the four pixels it covers. x: 1 lit,
+// 0 shadowed; y: that pixel's view distance, -1 for sky.
+vec4 AU_TraceHalfResContact()
+{
+    ivec2 size = textureSize(uDepthTexture, 0);
+    ivec2 corner = ivec2(gl_FragCoord.xy) * 2, pixel = corner;
+    float depth = 2.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 candidate = min(corner + ivec2(k & 1, k >> 1), size - 1);
+        float candidateDepth = texelFetch(uDepthTexture, candidate, 0).r;
+        if (candidateDepth < depth) { depth = candidateDepth; pixel = candidate; }
+    }
+#if USE_LINEAR_Z
+    vec3 position = fragFrustumRay * min(depth, 1.0);   // this texel's ray: within half a pixel of the chosen one
+#else
+    vec3 position = PositionFromDepth(min(depth, 1.0), (vec2(pixel) + 0.5) / vec2(size), InvViewProjectionMatrix);
+#endif
+    vec3 planeN = fastNormalFromPosition(position);   // screen derivatives: before any return
+    if (depth >= 1.0) return vec4(1.0, -1.0, 0.0, 0.0);
+    vec3 lightDir = normalize(vec3(SunShadowMatrix[0][0][2], SunShadowMatrix[0][1][2], SunShadowMatrix[0][2][2]));
+    float lView = length(position);
+    vec3 normalWS = vec3(0.0, 1.0, 0.0);
+#if USE_NORMAL_BIAS || USE_CLEAN_BACKFACES
+    vec3 tex = texelFetch(uGBuffer1Texture, pixel, 0).rga;
+    normalWS = decodeNormal(tex.rg);
+    if (tex.b > 0.5 && dot(normalWS, lightDir) >= 0.0) return vec4(1.0, lView, 0.0, 0.0);   // faces away from the sun
+#endif
+    if (lView >= min(AU_CONTACT_SHADOW_DISTANCE, max(SunShadowCascadeStats[CASCADE_COUNT - 1].x, 1.0))) return vec4(1.0, lView, 0.0, 0.0);
+    return vec4(ContactShadow(position, normalWS, planeN, -lightDir, BlueNoise(gl_FragCoord.xy, 2)), lView, 0.0, 0.0);
+}
+
+// The half-resolution contact shadow for a full-resolution pixel: the four nearest texels, weighted
+// by how close the distance each one traced is to this pixel's. -1 where none of them saw a surface.
+float AU_UpsampleContact(vec2 uv, float lView)
+{
+    ivec2 size = textureSize(uHookVL, 0);
+    vec2 position = uv * vec2(size) - 0.5;
+    ivec2 base = ivec2(floor(position));
+    vec2 f = position - vec2(base);
+    float sum = 0.0, total = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 offset = ivec2(k & 1, k >> 1);
+        vec2 traced = texelFetch(uHookVL, clamp(base + offset, ivec2(0), size - 1), 0).xy;
+        if (traced.y < 0.0) continue;
+        float weight = ((offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y) + 0.001)
+                     / (0.001 + abs(traced.y - lView) / max(lView, 1.0));
+        sum += traced.x * weight;
+        total += weight;
+    }
+    return total > 0.0 ? sum / total : -1.0;
+}
+#endif
+
 // Distant-terrain shadows: beyond
 // the shadow map, trace towards the sun through the depth buffer in big steps so distant
 // trees and hills still shade themselves and the ground behind them.
@@ -116,6 +174,9 @@ float FarShadow(vec3 pos, vec3 toSun, float dither, bool foliage)
 
 void main()
 {
+#if AU_CONTACT_SHADOWS
+    if (uHookVLPass == 1) { outColor = AU_TraceHalfResContact(); return; }
+#endif
     float depth = texture(uDepthTexture, fragTexCoords).r;
     if (depth >= 1.0) discard;
 
@@ -277,7 +338,8 @@ void main()
     float contactDist = min(AU_CONTACT_SHADOW_DISTANCE, farCascade);
     vec3 planeN = fastNormalFromPosition(positionNoBias);   // screen derivatives: outside the branch
     if (visibility > 0.01 && lView < contactDist && !backLit) {
-        float contact = ContactShadow(positionNoBias, normalWS, planeN, -lightDir, dither);
+        float contact = uHookVLPass == 2 ? AU_UpsampleContact(fragTexCoords, lView) : -1.0;
+        if (contact < 0.0) contact = ContactShadow(positionNoBias, normalWS, planeN, -lightDir, dither);
 #if AU_POLISH_ENABLE && AU_POLISH_SUNLIGHT && AU_POLISH_SUN_SHADOWS
         contact = mix(1.0, contact, mix(1.0, clamp(AU_POLISH_CONTACT_WEIGHT, 0.0, 1.0), sunlightWeight));
 #endif

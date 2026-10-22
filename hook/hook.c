@@ -1662,9 +1662,10 @@ static void gi_draw(GLenum mode, GLint first, GLsizei count)
     r_glUniform1i(program->locPTPass, 0);
     if (program->locLocalLightTiles >= 0) r_glUniform1i(program->locLocalLightTiles, 0);
 }
-// Light shafts and GTAO at half resolution: the two are most of DeferredFS's cost, and both are
-// soft. One extra draw of DeferredFS (uHookVLPass 1) traces only those into two half-size
-// targets; the real draw (uHookVLPass 2) upsamples them by depth. 0 = trace per pixel as before.
+// Half-resolution passes for any program with uHookVLPass: one extra draw of it (uHookVLPass 1)
+// traces only its soft, costly parts into two half-size targets, and the real draw (uHookVLPass 2)
+// upsamples them by depth; 0 = trace per pixel as before. DeferredShadowFS traces its contact
+// shadows; DeferredFS, later in the frame, its light shafts, GTAO and cloud shadows.
 #define VL_GL_BLEND 0x0BE2
 #define VL_GL_SCISSOR_TEST 0x0C11
 #define VL_GL_DRAW_FRAMEBUFFER 0x8CA9
@@ -1725,7 +1726,7 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
         bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
         g_vlW = complete ? width : 0;
         g_vlH = complete ? height : 0;
-        logf_("light shafts and GTAO at half resolution: %dx%d %s", width, height, complete ? "ready" : "unavailable");
+        logf_("half-resolution targets: %dx%d %s", width, height, complete ? "ready" : "unavailable");
         if (!complete) return;
     }
     GLboolean blend = isEnabled(VL_GL_BLEND), scissor = isEnabled(VL_GL_SCISSOR_TEST);
@@ -1733,7 +1734,7 @@ static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count
     setViewport(0, 0, width, height);
     if (blend) disable(VL_GL_BLEND);
     if (scissor) disable(VL_GL_SCISSOR_TEST);
-    profile_use("Half-res shafts+GTAO");
+    profile_use("Half-res pass");
     r_glUniform1i(program->locVLPass, 1);
     r_glDrawArrays(mode, first, count);
     bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
