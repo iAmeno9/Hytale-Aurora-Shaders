@@ -58,6 +58,14 @@ flat in vec3 auSkyLightCube[6];   // the sky's ambient light per facing (ScreenV
 
 layout(location = 0) out vec4 outColor;
 
+// Sky in the depth texture. Hytale's linear Z (view depth * 1 / far) leaves it a hair under 1.0,
+// so a test for exactly 1.0 took the sky for a surface at the far plane.
+#if USE_LINEAR_Z
+#define AU_IS_SKY(depth) ((depth) >= 0.999)
+#else
+#define AU_IS_SKY(depth) ((depth) >= 1.0)
+#endif
+
 #define AU_HALF_RES_CLOUDS (AU_CLOUDS && AU_CLOUD_SHADOWS)
 #define AU_HALF_RES_GI (AU_PRESET >= 2 && !AU_VOXELS && !AU_GI_DENOISE)   // the denoiser filters per pixel
 #if AU_LIGHTSHAFTS || AU_AO_METHOD == 1 || AU_HALF_RES_CLOUDS || AU_HALF_RES_GI
@@ -147,7 +155,7 @@ vec4 AU_TraceHalfResVL()
     vec3 geometricNormal = fastNormalFromPosition(PositionFromDepth(min(depth, 1.0), planeUV, InvViewProjectionMatrix));
 #endif
 #endif
-    if (depth >= 1.0) {
+    if (AU_IS_SKY(depth)) {
         // All sky: trace the sky's shafts here for SkyFS (a = -1), along this texel's view ray.
         vec2 skyUV = (vec2(corner) + 1.0) / vec2(size);
 #if USE_LINEAR_Z
@@ -270,7 +278,7 @@ vec4 AU_TraceHitLight()
         float candidateDepth = texelFetch(uDepthTexture, candidate, 0).r;
         if (candidateDepth < depth) { depth = candidateDepth; pixel = candidate; }
     }
-    if (depth >= 1.0) return vec4(0.0);
+    if (AU_IS_SKY(depth)) return vec4(0.0);
     vec2 albedoSky;
     return vec4(min(AU_GIHitLightData((vec2(pixel) + 0.5) / vec2(size), albedoSky), vec3(1.5)), 1.0);
 }
@@ -343,7 +351,7 @@ void main()
 
     vec2 texCoords = fragTexCoords;
     float depth = texture(uDepthTexture, texCoords).r;
-    if (depth >= 1.0) {
+    if (AU_IS_SKY(depth)) {
 #if AU_GI_DENOISE
 #if AU_GI_TEMPORAL_FILTER
         if (uHookPTPass == 3) {
