@@ -57,7 +57,7 @@ float GetCloudWind()
     return 0.0006 * Time * AU_CLOUD_SPEED;
 }
 
-float GetCloudNoise(vec3 tracePos, float cloudAltitude, float lTracePosXZ, float cloudPlayerPosY, float footprint)
+float GetCloudNoise(vec3 tracePos, float cloudAltitude, float lTracePosXZ, float cloudPlayerPosY, float footprint, int octaves)
 {
     vec3 tracePosM = tracePos.xyz * cloudNarrowness;
     float wind = GetCloudWind();
@@ -65,11 +65,10 @@ float GetCloudNoise(vec3 tracePos, float cloudAltitude, float lTracePosXZ, float
     float currentPersist = 1.0;
     float total = 0.0;
 
-    const int sampleCount = 4;
     const float persistance = 0.5;
     float noiseMult = 1.14; // CLOUD_QUALITY 2, main (deferred1) path
 
-    for (int i = 0; i < sampleCount; i++) {
+    for (int i = 0; i < octaves; i++) {
         float lod = log2(max(footprint * cloudNarrowness * float(textureSize(noisetex, 0).x), 1.0));
         noise += Noise3D(tracePosM - vec3(0.0, 0.0, wind), lod) * currentPersist;
         total += currentPersist;
@@ -88,6 +87,11 @@ float GetCloudNoise(vec3 tracePos, float cloudAltitude, float lTracePosXZ, float
     float threshold = clamp(abs(cloudAltitude - tracePos.y) / cloudStretch, 0.001, 0.999);
     threshold = pow2(pow2(pow2(threshold)));
     return noise - (threshold * 0.2 + 0.25);
+}
+
+float GetCloudNoise(vec3 tracePos, float cloudAltitude, float lTracePosXZ, float cloudPlayerPosY, float footprint)
+{
+    return GetCloudNoise(tracePos, cloudAltitude, lTracePosXZ, cloudPlayerPosY, footprint, 4);
 }
 
 float GetCloudNoise(vec3 tracePos, float cloudAltitude, float lTracePosXZ, float cloudPlayerPosY)
@@ -260,7 +264,9 @@ float AU_CloudLayerShadow(vec3 worldPos, float altitude, int sampleCount)
         vec3 cloudPos = worldPos + lightVec * t;
         cloudPos.y = alt;
         float footprint = max(t * 0.0093, max(sampleSpan, 8.0));
-        float noise = GetCloudNoise(cloudPos, altitude, 0.0, 0.0, footprint);
+        // Seen from the ground through hundreds of blocks of cloud, the two finest octaves only
+        // sharpen the shadow's edge; they cost as much per pixel as the shapes themselves.
+        float noise = GetCloudNoise(cloudPos, altitude, 0.0, 0.0, footprint, 2);
         opticalDepth += max(noise, 0.0) * layerWeight * (2.0 / float(sampleCount));
     }
     return opticalDepth;
