@@ -214,6 +214,19 @@ def make_particle_fs(s):
     return s[:nl] + '#include "AU_Tonemap.glsl"\n' + s[nl:]
 
 
+def make_ssao_fs(s):
+    # The game's SSAOFS without its taps where the pack's GTAO replaces them (DeferredFS): only
+    # foliage and two-sided models, the surfaces without clean backfaces, still use this occlusion.
+    # The shadow mask this pass also filters is untouched.
+    s = replace(s, '#include "Noise_inc.glsl"\n', '#include "Noise_inc.glsl"\n#include "AU_Settings.glsl"\n')
+    return replace(s, "    if (ssaoDistanceScale < 1.0)\n",
+                   "#if AU_AO_METHOD == 1\n"
+                   "    if (ssaoDistanceScale < 1.0 && texture(uGBufferTexture, fragTexCoords).a <= 0.5)   // Aurora\n"
+                   "#else\n"
+                   "    if (ssaoDistanceScale < 1.0)\n"
+                   "#endif\n")
+
+
 def make_jittered_vs(s):
     s, count = re.subn(r"void\s+main\s*\(\s*(?:void)?\s*\)", "void auGameMain()", s, count=1)
     if not count:
@@ -295,6 +308,7 @@ def prepare(executable, pack, assets=None):
         "Batcher2DFS.glsl": make_batcher_fs(sources["Batcher2DFS.glsl"]),
         "ZOnlyChunkVS.glsl": make_shadow_chunk_vs(sources["ZOnlyChunkVS.glsl"]),
         "ZOnlyChunkFS.glsl": make_shadow_chunk_fs(sources["ZOnlyChunkFS.glsl"]),
+        "SSAOFS.glsl": make_ssao_fs(sources["SSAOFS.glsl"]),
     }
     for name in ("BlockyModelVS", "ParticleVS", "SkyAndCloudsVS", "BasicVS", "BasicFogVS", "BeamVS", "TextVS"):
         generated[name + ".glsl"] = make_jittered_vs(sources[name + ".glsl"])

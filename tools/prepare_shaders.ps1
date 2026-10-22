@@ -312,6 +312,18 @@ public static class AuroraPrep
         File.WriteAllText(Path.Combine(pack, "programs", "ParticleFS.glsl"), s, Utf8);
     }
 
+    // The game's SSAOFS without its taps where the pack's GTAO replaces them (DeferredFS): only
+    // foliage and two-sided models, the surfaces without clean backfaces, still use this occlusion.
+    public static void MakeSSAOFS(string pack)
+    {
+        string s = Read(Path.Combine(pack, "original", "SSAOFS.glsl"));
+        s = Rep(s, "#include \"Noise_inc.glsl\"\n", "#include \"Noise_inc.glsl\"\n#include \"AU_Settings.glsl\"\n");
+        s = Rep(s, "    if (ssaoDistanceScale < 1.0)\n", "#if AU_AO_METHOD == 1\n"
+            + "    if (ssaoDistanceScale < 1.0 && texture(uGBufferTexture, fragTexCoords).a <= 0.5)   // Aurora\n"
+            + "#else\n    if (ssaoDistanceScale < 1.0)\n#endif\n");
+        File.WriteAllText(Path.Combine(pack, "programs", "SSAOFS.glsl"), s, Utf8);
+    }
+
     public static void MakeShadowChunk(string pack, string snip)
     {
         string vertex = Read(Path.Combine(pack, "original", "ZOnlyChunkVS.glsl"));
@@ -487,3 +499,5 @@ foreach ($vs in 'BlockyModelVS', 'ParticleVS', 'SkyAndCloudsVS', 'BasicVS', 'Bas
 Write-Host 'Generated the jittered scene vertex shaders'
 [AuroraPrep]::MakeScreenVS($pack)
 Write-Host 'Generated shaderpack\programs\ScreenVS.glsl'
+[AuroraPrep]::MakeSSAOFS($pack)
+Write-Host 'Generated shaderpack\programs\SSAOFS.glsl'
