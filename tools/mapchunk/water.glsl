@@ -167,7 +167,12 @@
         if (IsCameraUnderwater < 0.5) AU_ApplyMist(outColor0.rgb, fragPositionWS, auDither);
         // The background already carries the shafts up to the riverbed; the water surface
         // hides part of them, so put that part back in front of it.
-        if (IsCameraUnderwater < 0.5) auForwardVL = GetVolumetricLight(nViewPos, lViewPos, false, auDither) * auVLHidden;
+        if (IsCameraUnderwater < 0.5) {
+            // DeferredFS traced these shafts at half resolution to the riverbed behind this pixel: close
+            // enough for the part in front of the surface, and much cheaper than tracing them again.
+            vec4 auTraced = AU_UpsampleVL(screenUV, length(floorFromCamWS));
+            auForwardVL = (auTraced.a > 0.0 ? auTraced.rgb : GetVolumetricLight(nViewPos, lViewPos, false, auDither)) * auVLHidden;
+        }
 #if AU_DEBUG_WATER == 1
         outColor0.rgb = glColor;
 #elif AU_DEBUG_WATER == 2

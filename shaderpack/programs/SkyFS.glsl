@@ -130,7 +130,8 @@ void main()
 
     AU_ApplyMist(sky, dir * 100000.0, dither);
     sky += AU_GetRainbow(dir, 100000.0, true, dither);
-    sky = AU_AddVL(sky, GetVolumetricLight(dir, 100000.0, true, dither));
+    vec4 skyVL = AU_UpsampleVL(gl_FragCoord.xy * InvViewportSize, -1.0);   // traced at half resolution by DeferredFS
+    sky = AU_AddVL(sky, skyVL.a > 0.0 ? skyVL.rgb : GetVolumetricLight(dir, 100000.0, true, dither));
     // Sky seen from inside a cave (openings, or chunks the game culled): cave fog.
     // Only when deep inside (openings, or chunks the game culled), not while stepping out.
 #if AU_BIOME_ATMOSPHERE

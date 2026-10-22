@@ -14,6 +14,43 @@ vec3 AU_AddVL(vec3 color, vec3 vl)
     return pow(pow(max(color, vec3(0.0)), vec3(2.2)) + vl, vec3(1.0 / 2.2));
 }
 
+uniform sampler2D uHookVL;  // DeferredFS's half-resolution shafts (rgb) and the view distance traced to (a, -1 for sky)
+uniform int uHookVLReady;   // the hook ran that pass this frame
+
+// The four nearest half-resolution texels. A surface (lViewPos > 0) weights them by how close the
+// distance each one traced is to its own. Where none saw a surface (thin geometry, water over a bed
+// out of sight) and for the sky itself (lViewPos < 0), the sky texels' shafts along nearby rays:
+// the closest thing traced, and far cheaper than tracing again. a = 0 when nothing was traced.
+vec4 AU_UpsampleVL(vec2 uv, float lViewPos)
+{
+#if !AU_LIGHTSHAFTS
+    return vec4(0.0);
+#else
+    if (uHookVLReady == 0) return vec4(0.0);
+    ivec2 size = textureSize(uHookVL, 0);
+    vec2 position = uv * vec2(size) - 0.5;
+    ivec2 base = ivec2(floor(position));
+    vec2 f = position - vec2(base);
+    vec3 surfaceSum = vec3(0.0), skySum = vec3(0.0);
+    float surfaceTotal = 0.0, skyTotal = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 offset = ivec2(k & 1, k >> 1);
+        vec4 traced = texelFetch(uHookVL, clamp(base + offset, ivec2(0), size - 1), 0);
+        float weight = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y) + 0.001;
+        if (traced.a < 0.0) {
+            skySum += traced.rgb * weight;
+            skyTotal += weight;
+        } else if (lViewPos > 0.0) {
+            weight /= 0.001 + abs(traced.a - lViewPos) / max(lViewPos, 1.0);
+            surfaceSum += traced.rgb * weight;
+            surfaceTotal += weight;
+        }
+    }
+    if (surfaceTotal > 0.0) return vec4(surfaceSum / surfaceTotal, 1.0);
+    return skyTotal > 0.0 ? vec4(skySum / skyTotal, 1.0) : vec4(0.0);
+#endif
+}
+
 // nPlayerPos: normalised world-space view direction. lViewPos1: distance to the opaque
 // surface (ignored for sky pixels).
 vec3 GetVolumetricLight(vec3 nPlayerPos, float lViewPos1, bool sky, float dither)

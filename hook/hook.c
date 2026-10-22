@@ -502,6 +502,8 @@ typedef struct {
     GLint locCurrentProjection;
     GLint locGICompact, locGISourceSize, locGIPreviousInverse, locGIPreviousDepth;
     GLint locVoxGeo, locVoxCol;
+    GLint locVLPass;         // uHookVLPass: DeferredFS traces the light shafts at half resolution
+    GLint locVLReady;        // uHookVLReady: those shafts are in uHookVL (DeferredFS, water)
     GLint locNativeEmission;
     GLint locMaterialLOD;
     GLint locJitter, locUIFragmentScale;
@@ -983,12 +985,13 @@ static int relink_program(GLuint prog, ProgRec *p, int useOverrides)
 // Hytale's macOS build binds its own textures to units 16-18. A pack sampler of another type on
 // the same unit is an error there and the draw is dropped (water vanished), so the hook's own
 // textures (materials, emission, SSS masks) start at 32, which macOS's 80 combined units allow.
-#define MAX_UNITS 48
 #define HOOK_UNIT_BASE 32
 #else
-#define MAX_UNITS 32
 #define HOOK_UNIT_BASE 16
 #endif
+#define MAX_UNITS 48
+#define VL_UNIT 36   // half-resolution light shafts; GL 4.1 guarantees 80 combined units
+#define AO_UNIT 37   // half-resolution GTAO, from the same pass
 typedef struct { GLenum target; GLuint tex; GLuint sampler; } UnitState;
 static UnitState g_units[MAX_UNITS];
 static GLuint g_activeUnit;
@@ -1140,6 +1143,7 @@ static void gi_bind(int temporal, int raw, int divisor, int compact, int lights)
 static void profile_use(const char *name);
 static void gi_release(void);
 static void gi_draw(GLenum mode, GLint first, GLsizei count);
+static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count);
 static GLuint g_dlssProg; // the program writing the DLSS inputs (PostEffectFS, see dlss_draw)
 static int g_dlssRR;
 static int g_dlssPending; // inputs written this frame, DLSS runs at the present (dlss_present)
@@ -1182,6 +1186,7 @@ AU_GL_EXPORT void APIENTRY glDrawArrays(GLenum mode, GLint first, GLsizei count)
     if (program) temporal_prepare(program);
     share_draw_capture();
     if (g_matProgRec) materials_draw_check();
+    if (program && program->locVLPass >= 0) vl_prepass(program, mode, first, count);
     if (g_giProg && g_giProg == g_curProg) { gi_draw(mode, first, count); return; }
     if (g_dlssProg && g_dlssProg == g_curProg) { dlss_draw(mode, first, count); return; }
     if (g_dlssPending && dlss_present()) return;
@@ -1657,6 +1662,100 @@ static void gi_draw(GLenum mode, GLint first, GLsizei count)
     r_glUniform1i(program->locPTPass, 0);
     if (program->locLocalLightTiles >= 0) r_glUniform1i(program->locLocalLightTiles, 0);
 }
+// Light shafts and GTAO at half resolution: the two are most of DeferredFS's cost, and both are
+// soft. One extra draw of DeferredFS (uHookVLPass 1) traces only those into two half-size
+// targets; the real draw (uHookVLPass 2) upsamples them by depth. 0 = trace per pixel as before.
+#define VL_GL_BLEND 0x0BE2
+#define VL_GL_SCISSOR_TEST 0x0C11
+#define VL_GL_DRAW_FRAMEBUFFER 0x8CA9
+#define VL_GL_DRAW_FRAMEBUFFER_BINDING 0x8CA6
+#define VL_GL_COLOR_ATTACHMENT0 0x8CE0
+static GLuint g_vlTex, g_aoTex, g_vlFbo;
+static int g_vlW, g_vlH;
+
+static void vl_prepass(ProgRec *program, GLenum mode, GLint first, GLsizei count)
+{
+    static void (APIENTRY *genFramebuffers)(GLsizei, GLuint *), (APIENTRY *bindFramebuffer)(GLenum, GLuint);
+    static void (APIENTRY *framebufferTexture)(GLenum, GLenum, GLenum, GLuint, GLint);
+    static void (APIENTRY *drawBuffers)(GLsizei, const GLenum *);
+    static GLenum (APIENTRY *checkFramebuffer)(GLenum);
+    static void (APIENTRY *setViewport)(GLint, GLint, GLsizei, GLsizei);
+    static GLboolean (APIENTRY *isEnabled)(GLenum);
+    static void (APIENTRY *enable)(GLenum), (APIENTRY *disable)(GLenum);
+    if (!genFramebuffers) {
+        genFramebuffers = (void *)real_wglGetProcAddress("glGenFramebuffers");
+        bindFramebuffer = (void *)real_wglGetProcAddress("glBindFramebuffer");
+        framebufferTexture = (void *)real_wglGetProcAddress("glFramebufferTexture2D");
+        drawBuffers = (void *)real_wglGetProcAddress("glDrawBuffers");
+        checkFramebuffer = (void *)real_wglGetProcAddress("glCheckFramebufferStatus");
+        setViewport = (void *)GetProcAddress(g_real, "glViewport");
+        isEnabled = (void *)GetProcAddress(g_real, "glIsEnabled");
+        enable = (void *)GetProcAddress(g_real, "glEnable");
+        disable = (void *)GetProcAddress(g_real, "glDisable");
+    }
+    r_glUniform1i(program->locVLPass, 0);
+    GLint viewport[4], drawFramebuffer = 0;
+    r_glGetIntegerv(GL_VIEWPORT, viewport);
+    int width = (viewport[2] + 1) / 2, height = (viewport[3] + 1) / 2;
+    if (!genFramebuffers || !bindFramebuffer || !framebufferTexture || !drawBuffers || !checkFramebuffer || width <= 0 || height <= 0) return;
+    r_glGetIntegerv(VL_GL_DRAW_FRAMEBUFFER_BINDING, &drawFramebuffer);
+    if (width != g_vlW || height != g_vlH) {
+        PFN_glGenTextures gen = (PFN_glGenTextures)GetProcAddress(g_real, "glGenTextures");
+        PFN_glTexImage2D image = (PFN_glTexImage2D)GetProcAddress(g_real, "glTexImage2D");
+        PFN_glTexParameteri parameter = (PFN_glTexParameteri)GetProcAddress(g_real, "glTexParameteri");
+        GLint previousTexture = 0;
+        r_glGetIntegerv(GL_TEXTURE_BINDING_2D, &previousTexture);
+        if (!g_vlTex) gen(1, &g_vlTex);
+        if (!g_aoTex) gen(1, &g_aoTex);
+        if (!g_vlFbo) genFramebuffers(1, &g_vlFbo);
+        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
+        for (int target = 0; target < 2; target++) {
+            r_glBindTexture(GL_TEXTURE_2D, target ? g_aoTex : g_vlTex);
+            if (target) image(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+            else image(GL_TEXTURE_2D, 0, GL_RGBA16F, width, height, 0, GL_RGBA, GL_FLOAT, NULL);
+            parameter(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            parameter(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            parameter(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+            framebufferTexture(VL_GL_DRAW_FRAMEBUFFER, VL_GL_COLOR_ATTACHMENT0 + target, GL_TEXTURE_2D, target ? g_aoTex : g_vlTex, 0);
+        }
+        r_glBindTexture(GL_TEXTURE_2D, (GLuint)previousTexture);
+        static const GLenum targets[2] = {VL_GL_COLOR_ATTACHMENT0, VL_GL_COLOR_ATTACHMENT0 + 1};
+        drawBuffers(2, targets);
+        int complete = checkFramebuffer(VL_GL_DRAW_FRAMEBUFFER) == 0x8CD5;   // GL_FRAMEBUFFER_COMPLETE
+        bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
+        g_vlW = complete ? width : 0;
+        g_vlH = complete ? height : 0;
+        logf_("light shafts and GTAO at half resolution: %dx%d %s", width, height, complete ? "ready" : "unavailable");
+        if (!complete) return;
+    }
+    GLboolean blend = isEnabled(VL_GL_BLEND), scissor = isEnabled(VL_GL_SCISSOR_TEST);
+    bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, g_vlFbo);
+    setViewport(0, 0, width, height);
+    if (blend) disable(VL_GL_BLEND);
+    if (scissor) disable(VL_GL_SCISSOR_TEST);
+    profile_use("Half-res shafts+GTAO");
+    r_glUniform1i(program->locVLPass, 1);
+    r_glDrawArrays(mode, first, count);
+    bindFramebuffer(VL_GL_DRAW_FRAMEBUFFER, (GLuint)drawFramebuffer);
+    setViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    if (blend) enable(VL_GL_BLEND);
+    if (scissor) enable(VL_GL_SCISSOR_TEST);
+    profile_use(program->pname);
+    for (int target = 0; target < 2; target++) {
+        int unit = target ? AO_UNIT : VL_UNIT;
+        GLuint texture = target ? g_aoTex : g_vlTex;
+        r_glActiveTexture(GL_TEXTURE0 + unit);
+        r_glBindTexture(GL_TEXTURE_2D, texture);
+        if (r_glBindSampler) r_glBindSampler(unit, 0);
+        g_units[unit].target = GL_TEXTURE_2D;
+        g_units[unit].tex = texture;
+        g_units[unit].sampler = 0;
+    }
+    r_glActiveTexture(GL_TEXTURE0 + g_activeUnit);
+    r_glUniform1i(program->locVLPass, 2);
+    if (program->locVLReady >= 0) r_glUniform1i(program->locVLReady, 1);
+}
+
 // ----------------------------------------------------------------------------------------
 // Block materials. Hytale's terrain has no material data, so the hook reads its block atlas
 // (the texture array MapChunkFS samples as uTexture) once, fingerprints every 32x32 tile and
@@ -2603,6 +2702,13 @@ static void check_extras(GLuint prog, ProgRec *p)
     p->usesGI = 0;
     p->locPTPass = r_glGetUniformLocation(prog, "uHookPTPass");
     p->locLocalLightTiles = r_glGetUniformLocation(prog, "uHookLocalLightTiles");
+    p->locVLPass = r_glGetUniformLocation(prog, "uHookVLPass");
+    GLint locVL = r_glGetUniformLocation(prog, "uHookVL");
+    if (locVL >= 0) r_glUniform1i(locVL, VL_UNIT);
+    GLint locAO = r_glGetUniformLocation(prog, "uHookAO");
+    if (locAO >= 0) r_glUniform1i(locAO, AO_UNIT);
+    p->locVLReady = r_glGetUniformLocation(prog, "uHookVLReady");
+    if (p->locVLPass >= 0 || p->locVLReady >= 0) p->hasExtras = 1;
     p->giDenoise = r_glGetUniformLocation(prog, "auGIRaw") >= 0;
     p->giTemporal = r_glGetUniformLocation(prog, "auGIHist") >= 0;
     p->giLegacy = p->giTemporal && !p->giDenoise;
@@ -2712,6 +2818,7 @@ static void apply_extras(ProgRec *p)
         if (g_postPresent || !temporal_geometry(p)) r_glUniform2f(p->locJitter, 0.0f, 0.0f);
         else r_glUniform2f(p->locJitter, g_jitterNdc[0], g_jitterNdc[1]);
     }
+    if (p->locVLReady >= 0) r_glUniform1i(p->locVLReady, g_vlW > 0);
     if (p->usesGI) g_giProg = g_curProg;
     if (p->usesDlss) g_dlssProg = g_curProg;
     if (p->locFrame >= 0) r_glUniform1i(p->locFrame, g_frame);

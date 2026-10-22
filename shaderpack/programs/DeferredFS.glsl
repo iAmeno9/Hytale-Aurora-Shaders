@@ -56,7 +56,84 @@ in vec2 fragTexCoords;
 flat in vec3 auSkyLightCube[6];   // the sky's ambient light per facing (ScreenVS, AU_SkyLight.glsl)
 #endif
 
-out vec4 outColor;
+layout(location = 0) out vec4 outColor;
+
+#if AU_LIGHTSHAFTS || AU_AO_METHOD == 1
+uniform int uHookVLPass;    // 1: this draw only traces the light shafts and GTAO, at half resolution; 2: they are in uHookVL / uHookAO
+#if AU_AO_METHOD == 1
+layout(location = 1) out vec4 outAO;   // half-resolution pass: GTAO bent normal (world space, * 0.5 + 0.5) and visibility
+uniform sampler2D uHookAO;
+
+// The half-resolution GTAO for a full-resolution pixel: the four nearest texels, weighted like the
+// shafts by how close the distance each one traced is to this pixel's, and by how well its bent
+// normal fits this pixel's normal (texels of the other face at a crease). xyz: bent normal, w: visibility.
+vec4 AU_UpsampleAO(vec2 uv, float lViewPos, vec3 normal)
+{
+    ivec2 size = textureSize(uHookAO, 0);
+    vec2 position = uv * vec2(size) - 0.5;
+    ivec2 base = ivec2(floor(position));
+    vec2 f = position - vec2(base);
+    vec4 sum = vec4(0.0);
+    float total = 0.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 offset = ivec2(k & 1, k >> 1);
+        ivec2 texel = clamp(base + offset, ivec2(0), size - 1);
+        float traced = texelFetch(uHookVL, texel, 0).a;
+        if (traced < 0.0) continue;   // sky
+        vec4 ao = texelFetch(uHookAO, texel, 0);
+        vec3 bent = ao.xyz * 2.0 - 1.0;
+        float weight = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y) + 0.001;
+        weight *= max(dot(bent, normal), 0.05) / (0.001 + abs(traced - lViewPos) / max(lViewPos, 1.0));
+        sum += vec4(bent, ao.a) * weight;
+        total += weight;
+    }
+    return total > 0.0 && dot(sum.xyz, sum.xyz) > 1e-8 ? vec4(normalize(sum.xyz), sum.w / total) : vec4(normal, 1.0);
+}
+#endif
+
+// Half-resolution pass: each texel traces the nearest of the four pixels it covers, so thin
+// geometry in front of the sky still gets a sample; all-sky texels trace the sky for SkyFS.
+vec4 AU_TraceHalfResVL()
+{
+    ivec2 size = textureSize(uDepthTexture, 0);
+    ivec2 corner = ivec2(gl_FragCoord.xy) * 2, pixel = corner;
+    float depth = 2.0;
+    for (int k = 0; k < 4; k++) {
+        ivec2 candidate = min(corner + ivec2(k & 1, k >> 1), size - 1);
+        float candidateDepth = texelFetch(uDepthTexture, candidate, 0).r;
+        if (candidateDepth < depth) { depth = candidateDepth; pixel = candidate; }
+    }
+    if (depth >= 1.0) {
+        // All sky: trace the sky's shafts here for SkyFS (a = -1), along this texel's view ray.
+        vec2 skyUV = (vec2(corner) + 1.0) / vec2(size);
+#if USE_LINEAR_Z
+        vec3 ray = mat3(InvViewMatrix) * AU_ViewPosition(skyUV, FarClip * 0.5);
+#else
+        vec3 ray = PositionFromDepth(0.5, skyUV, InvViewProjectionMatrix);
+#endif
+        return vec4(GetVolumetricLight(normalize(ray), 100000.0, true, GetDither(gl_FragCoord.xy)), -1.0);
+    }
+    vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+#if USE_LINEAR_Z
+    vec3 playerPos = mat3(InvViewMatrix) * AU_ViewPosition(uv, depth * FarClip);
+#else
+    vec3 playerPos = PositionFromDepth(depth, uv, InvViewProjectionMatrix);
+#endif
+    float lViewPos = length(playerPos);
+#if AU_AO_METHOD == 1
+    vec3 normal = decodeNormal(texelFetch(uNormalTexture, pixel, 0).rg);
+#if !INPUT_NORMALS_IN_WS
+    normal = mat3(InvViewMatrix) * normal;
+#endif
+    vec3 bentNormalVS;
+    float visibility = AU_GTAOVisibilityBent(uDepthTexture, uv, (ViewMatrix * vec4(playerPos, 1.0)).xyz, normalize(mat3(ViewMatrix) * normal),
+                                             GetDither2(gl_FragCoord.xy + vec2(37.0, 71.0)), bentNormalVS);
+    outAO = vec4(normalize(mat3(InvViewMatrix) * bentNormalVS) * 0.5 + 0.5, visibility);
+#endif
+    return vec4(GetVolumetricLight(playerPos / max(lViewPos, 0.0001), lViewPos, false, GetDither(gl_FragCoord.xy)), lViewPos);
+}
+
+#endif
 
 float getShadowFactor(vec2 texCoords)
 {
@@ -168,6 +245,9 @@ void main()
     }
 #endif
     AU_InitCommon();
+#if AU_LIGHTSHAFTS || AU_AO_METHOD == 1
+    if (uHookVLPass == 1) { outColor = AU_TraceHalfResVL(); return; }
+#endif
 #if AU_SKY_LIGHTING == 1
     for (int face = 0; face < 6; face++) auSkyCube[face] = auSkyLightCube[face];
     auSkyCubeValid = true;
@@ -222,15 +302,22 @@ void main()
     // GTAO in place of Hytale's SSAO on solid surfaces (foliage keeps Hytale's): horizon-based
     // visibility from the depth buffer, with the light bounced between the occluding faces.
     if (hasSSAO && !hasBloom) {
-        vec3 posVS = (ViewMatrix * vec4(playerPos, 1.0)).xyz;
-        vec3 bentNormalVS;
-        float visibility = AU_GTAOVisibilityBent(uDepthTexture, texCoords, posVS, normalize(mat3(ViewMatrix) * normal),
-                                                 GetDither2(gl_FragCoord.xy + vec2(37.0, 71.0)), bentNormalVS);
-        ao = AU_GTAOMultiBounce(visibility, albedo);
+        vec4 traced;
+        if (uHookVLPass == 2) {
+            // Traced at half resolution by the light shaft pass: GTAO is most of this pass's cost.
+            traced = AU_UpsampleAO(texCoords, length(playerPos), normal);
+        } else {
+            vec3 posVS = (ViewMatrix * vec4(playerPos, 1.0)).xyz;
+            vec3 bentNormalVS;
+            traced.w = AU_GTAOVisibilityBent(uDepthTexture, texCoords, posVS, normalize(mat3(ViewMatrix) * normal),
+                                             GetDither2(gl_FragCoord.xy + vec2(37.0, 71.0)), bentNormalVS);
+            traced.xyz = normalize(mat3(InvViewMatrix) * bentNormalVS);
+        }
+        ao = AU_GTAOMultiBounce(traced.w, albedo);
         auAOIndirectOnly = true;
 #if AU_SKY_LIGHTING == 1 && AU_GTAO_BENT_NORMALS
         // Sky light from where the sky is open (recesses, under overhangs: from the opening).
-        auSkyNormal = normalize(mat3(InvViewMatrix) * bentNormalVS);
+        auSkyNormal = traced.xyz;
         auSkyNormalValid = true;
 #endif
     }
@@ -564,7 +651,11 @@ void main()
 
     // Volumetric light shafts in front of this surface.
     float lViewPos = length(playerPos);
-    color = AU_AddVL(color, GetVolumetricLight(playerPos / max(lViewPos, 0.0001), lViewPos, false, dither));
+    vec4 halfResVL = vec4(0.0);
+#if AU_LIGHTSHAFTS
+    if (uHookVLPass == 2) halfResVL = AU_UpsampleVL(texCoords, lViewPos);
+#endif
+    color = AU_AddVL(color, halfResVL.a > 0.0 ? halfResVL.rgb : GetVolumetricLight(playerPos / max(lViewPos, 0.0001), lViewPos, false, dither));
 
 #if AU_DEBUG_CLASS == 11
     color = gbuffer0.rgb;
